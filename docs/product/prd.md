@@ -1,9 +1,9 @@
 # PRD — FreeBuff Proxy Bridge
 
-**Status**: v1.1 in progress · **Date**: 2026-08-11 · **Stack**: Go 1.26+ (single binary)
+**Status**: v1.2 — MVP complete · **Date**: 2026-08-11 · **Stack**: Go 1.26+ (single binary)
 **Source of truth for protocol knowledge**: `docs/research/freebuff-reference-analysis.md`
 
-**Implementation status**: Slices 1–3 of `docs/delivery/tasks.md` are implemented and verified (`go build`/`go vet` green, 93 unit/integration tests passing). Slice 4 is half-done: `internal/convert` complete; `internal/server` + `internal/telemetry` + main.go wiring remain. Three defects found during the 2026-08-11 validation pass were fixed (pool shutdown deadlock, pool test constants, runs snapshot undercount — details in tasks.md). Known environment caveats: Kaspersky AV false-positive on one test binary (`docs/security/av-kaspersky-false-positive.md`), `-race` requires a C toolchain (CI/Linux).
+**Implementation status**: Slices 1–5 of `docs/delivery/tasks.md` are implemented and verified: `go build`/`go vet` green, 116 unit/integration tests passing locally, `go test -race ./...` green in GitHub Actions CI (Linux). The proxy serves `/v1/chat/completions` (stream + non-stream), `/v1/models`, `/healthz` with graceful SIGINT/SIGTERM drain, client auth, retry-once recovery, and the full PRD §6 error matrix. Six defects found during validation (2026-08-11) were fixed — including a production data race in the session single-flight and a pool shutdown deadlock (details in tasks.md). Environment caveats: Kaspersky AV false positive on one test binary (`docs/security/av-kaspersky-false-positive.md`), `-race` is CI-only (no C toolchain locally), Docker build not yet smoke-tested (no Docker host), live verification blocked on a real FreeBuff token.
 
 ## 1. Problem
 

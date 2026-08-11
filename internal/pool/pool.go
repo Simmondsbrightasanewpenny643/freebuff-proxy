@@ -151,6 +151,10 @@ func (p *Pool) Acquire(ctx context.Context, model string) (*Lease, error) {
 
 		instanceID, err := tok.session.EnsureSession(ctx)
 		if err != nil {
+			// Release the run lease we just acquired — otherwise the
+			// inflight counter never returns to zero and the run can
+			// never be FINISHed on rotation (draining-list leak).
+			tok.runs.Release(run)
 			var wr *session.WaitingRoomError
 			if errors.As(err, &wr) {
 				waiting = append(waiting, wr)

@@ -12,6 +12,10 @@ services:
   freebuff-proxy:
     build: .
     env_file: .env
+    environment:
+      # The proxy defaults to loopback only; the container must listen on
+      # all interfaces to accept the published port.
+      - LISTEN_ADDR=:3457
     ports:
       - "3457:3457"
     restart: unless-stopped

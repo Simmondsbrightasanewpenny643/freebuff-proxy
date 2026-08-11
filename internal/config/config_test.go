@@ -33,8 +33,8 @@ func TestDefaults(t *testing.T) {
 		t.Fatalf("Load: %v", err)
 	}
 
-	if cfg.ListenAddr != ":3457" {
-		t.Errorf("ListenAddr = %q, want %q", cfg.ListenAddr, ":3457")
+	if cfg.ListenAddr != "127.0.0.1:3457" {
+		t.Errorf("ListenAddr = %q, want %q", cfg.ListenAddr, "127.0.0.1:3457")
 	}
 	if cfg.UpstreamBaseURL != "https://www.codebuff.com" {
 		t.Errorf("UpstreamBaseURL = %q, want %q", cfg.UpstreamBaseURL, "https://www.codebuff.com")

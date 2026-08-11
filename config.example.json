@@ -1,5 +1,5 @@
 {
-  "LISTEN_ADDR": ":3457",
+  "LISTEN_ADDR": "127.0.0.1:3457",
   "UPSTREAM_BASE_URL": "https://codebuff.com",
   "AUTH_TOKENS": ["cb_xxx", "cb_yyy"],
   "ROTATION_INTERVAL": "6h",

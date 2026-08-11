@@ -54,7 +54,7 @@ type rawConfig struct {
 
 func defaultRawConfig() rawConfig {
 	return rawConfig{
-		ListenAddr:         ":3457",
+		ListenAddr:         "127.0.0.1:3457",       // loopback by default (PRD §3); containers set LISTEN_ADDR=:3457
 		UpstreamBaseURL:    "https://codebuff.com", // normalized to www.
 		RotationInterval:   "6h",
 		RequestTimeout:     "15m",

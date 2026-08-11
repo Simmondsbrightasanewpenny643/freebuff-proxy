@@ -41,7 +41,7 @@ Requires Go 1.26+ (see `go.mod`) or a prebuilt release binary.
    .\freebuff-proxy.exe
    ```
 
-   It listens on `:3457` (all interfaces) by default; restrict with `LISTEN_ADDR=127.0.0.1:3457` if the host is not firewalled.
+   It listens on `127.0.0.1:3457` (loopback only — the proxy holds FreeBuff tokens) by default; set `LISTEN_ADDR=:3457` to expose it on all interfaces (e.g. inside a container).
 
 4. Smoke test (Windows PowerShell: use `curl.exe`):
 
@@ -78,7 +78,7 @@ All keys are read from the environment and override the JSON config file passed 
 | Key | Default | Description |
 |---|---|---|
 | `AUTH_TOKENS` | _(none — REQUIRED)_ | FreeBuff auth token(s) for the upstream Codebuff API. Comma-separated for multiple accounts (round-robin + failover across tokens). |
-| `LISTEN_ADDR` | `:3457` | Listen address for the OpenAI-compatible API surface (`/v1/chat/completions`, `/v1/models`, `/healthz`). |
+| `LISTEN_ADDR` | `127.0.0.1:3457` | Listen address for the OpenAI-compatible API surface (`/v1/chat/completions`, `/v1/models`, `/healthz`). Loopback by default — the proxy holds FreeBuff tokens; use `:3457` only when firewalled/containerized. |
 | `UPSTREAM_BASE_URL` | `https://codebuff.com` | Upstream Codebuff base URL. The host is normalized to `www.codebuff.com`. |
 | `ROTATION_INTERVAL` | `6h` | How long an agent run lives upstream before it is rotated (FINISH + restart). |
 | `REQUEST_TIMEOUT` | `15m` | Timeout for a single upstream chat-completions request (stream included). |
