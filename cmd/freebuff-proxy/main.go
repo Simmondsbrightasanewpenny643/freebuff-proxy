@@ -1,15 +1,17 @@
 // Command freebuff-proxy is the FreeBuff proxy bridge entrypoint.
 //
 // Slice 1: config loading, the model registry (fallback at boot + background
-// refresh at REGISTRY_REFRESH), and a graceful SIGINT/SIGTERM shutdown. The
-// HTTP surface arrives in a later slice.
+// refresh at REGISTRY_REFRESH), and a graceful SIGINT/SIGTERM shutdown.
+// Slice 4: the OpenAI-compatible HTTP surface (/v1/chat/completions,
+// /v1/models, /healthz) over the multi-token pool, with graceful drain on
+// shutdown (server stops accepting first, then runs/sessions finish).
 package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
-	"io"
 	"log/slog"
 	"net/http"
 	"os"
@@ -18,7 +20,12 @@ import (
 	"time"
 
 	"freebuff-proxy/internal/config"
+	"freebuff-proxy/internal/pool"
 	"freebuff-proxy/internal/registry"
+	"freebuff-proxy/internal/server"
+	"freebuff-proxy/internal/session"
+	"freebuff-proxy/internal/telemetry"
+	"freebuff-proxy/internal/upstream"
 )
 
 func main() {
@@ -32,7 +39,10 @@ func main() {
 		os.Exit(1)
 	}
 
-	logger := newLogger(&cfg, *verbose)
+	logger := telemetry.NewLogger(*verbose, cfg.LogFile)
+	// The pool logs through slog.Default(); route it through our logger so
+	// verbose mode and the log file cover it too.
+	slog.SetDefault(logger)
 
 	// Load the hardcoded fallback immediately so the registry is usable
 	// offline; the first background refresh replaces it on success.
@@ -43,6 +53,36 @@ func main() {
 	defer stop()
 
 	go refreshLoop(ctx, logger, reg, cfg.RegistryRefresh)
+
+	// One upstream client and session manager per token, bound into the pool
+	// together with a per-token run manager.
+	clients := make([]*upstream.Client, 0, len(cfg.AuthTokens))
+	sessions := make([]*session.Manager, 0, len(cfg.AuthTokens))
+	for _, token := range cfg.AuthTokens {
+		client, err := upstream.New(token, &cfg)
+		if err != nil {
+			logger.Error("failed to build upstream client", "err", err)
+			os.Exit(1)
+		}
+		clients = append(clients, client)
+		sessions = append(sessions, session.NewManager(client))
+	}
+
+	p, err := pool.New(&cfg, clients, sessions, reg)
+	if err != nil {
+		logger.Error("failed to build pool", "err", err)
+		os.Exit(1)
+	}
+
+	// Prewarm + the 60s maintain loop run until ctx is canceled (shutdown).
+	p.Start(ctx)
+
+	srv := server.New(&cfg, p, reg, logger)
+	httpServer := &http.Server{
+		Addr:              cfg.ListenAddr,
+		Handler:           srv.Handler(),
+		ReadHeaderTimeout: 15 * time.Second,
+	}
 
 	// Startup summary — token values are never logged, only counts.
 	logger.Info("freebuff-proxy starting",
@@ -57,9 +97,33 @@ func main() {
 		"registry_models", reg.ModelCount(),
 		"verbose", *verbose,
 	)
+	logger.Info("listening", "addr", cfg.ListenAddr)
 
-	<-ctx.Done()
-	logger.Info("shutdown signal received; exiting")
+	// Serve until the server fails or a shutdown signal arrives.
+	serveErr := make(chan error, 1)
+	go func() {
+		serveErr <- httpServer.ListenAndServe()
+	}()
+
+	select {
+	case err := <-serveErr:
+		if err != nil && !errors.Is(err, http.ErrServerClosed) {
+			logger.Error("http server failed", "err", err)
+			stop() // cancel ctx: stop the pool jobs, then drain
+		}
+	case <-ctx.Done():
+	}
+
+	// Graceful drain: stop accepting new requests first, then finish
+	// runs/sessions, bounded by a 10s force deadline.
+	logger.Info("shutting down")
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := httpServer.Shutdown(shutdownCtx); err != nil {
+		logger.Warn("http server shutdown incomplete", "err", err)
+	}
+	p.Shutdown(shutdownCtx)
+	logger.Info("shutdown complete")
 }
 
 // refreshLoop refreshes the registry immediately, then every interval.
@@ -86,23 +150,4 @@ func logRegistryRefresh(ctx context.Context, logger *slog.Logger, reg *registry.
 		return
 	}
 	logger.Info("registry refreshed", "agents", len(reg.AgentIDs()), "models", reg.ModelCount())
-}
-
-// newLogger returns a text logger on stderr; when cfg.LogFile is set the same
-// lines are appended there (stderr keeps working for unit-level failures).
-func newLogger(cfg *config.Config, verbose bool) *slog.Logger {
-	level := slog.LevelInfo
-	if verbose {
-		level = slog.LevelDebug
-	}
-	w := io.Writer(os.Stderr)
-	if cfg.LogFile != "" {
-		f, err := os.OpenFile(cfg.LogFile, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "freebuff-proxy: warning: cannot open log file %s: %v\n", cfg.LogFile, err)
-		} else {
-			w = io.MultiWriter(os.Stderr, f)
-		}
-	}
-	return slog.New(slog.NewTextHandler(w, &slog.HandlerOptions{Level: level}))
 }

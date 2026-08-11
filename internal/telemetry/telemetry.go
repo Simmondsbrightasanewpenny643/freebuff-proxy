@@ -1,0 +1,199 @@
+// Package telemetry provides the leveled color/file logger, redacted header
+// copies, and optional request dumps for the freebuff-proxy bridge
+// (PRD §3: structured logging — color terminal + file, debug dump mode).
+package telemetry
+
+import (
+	"bytes"
+	"context"
+	"fmt"
+	"io"
+	"log/slog"
+	"net/http"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+)
+
+// ANSI 4-color scheme: DEBUG gray, INFO green, WARN yellow, ERROR red.
+const (
+	ansiGray   = "\x1b[90m"
+	ansiGreen  = "\x1b[32m"
+	ansiYellow = "\x1b[33m"
+	ansiRed    = "\x1b[31m"
+	ansiReset  = "\x1b[0m"
+)
+
+// timeFormat mirrors slog's text handler timestamp.
+const timeFormat = "2006-01-02T15:04:05.000Z07:00"
+
+// NewLogger builds the process logger: level Info, or Debug when verbose.
+// stderr gets the colorized text handler; when logFile is set the same lines
+// are appended there via io.MultiWriter. Coloring is disabled whenever a log
+// file is present — a single handler writes to both sinks and ANSI escapes
+// in a file are noise. A log file that cannot be opened is reported on
+// stderr and stderr-only logging continues.
+func NewLogger(verbose bool, logFile string) *slog.Logger {
+	level := slog.LevelInfo
+	if verbose {
+		level = slog.LevelDebug
+	}
+
+	w := io.Writer(os.Stderr)
+	var file *os.File
+	if logFile != "" {
+		f, err := os.OpenFile(logFile, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "freebuff-proxy: warning: cannot open log file %s: %v\n", logFile, err)
+		} else {
+			file = f
+			w = io.MultiWriter(os.Stderr, f)
+		}
+	}
+
+	h := &textHandler{w: w, level: level, colorize: logFile == "", file: file}
+	return slog.New(h)
+}
+
+// textHandler is a minimal slog text handler that colorizes the level token
+// (time=... level=INFO msg=... key=value...). WithAttrs/WithGroup are no-ops:
+// the process logger never carries bound attrs. file is the appended log
+// file (nil for stderr-only), kept for tests and a future shutdown close.
+type textHandler struct {
+	mu       sync.Mutex
+	level    slog.Leveler
+	w        io.Writer
+	colorize bool
+	file     *os.File
+}
+
+func (h *textHandler) Enabled(_ context.Context, level slog.Level) bool {
+	return level >= h.level.Level()
+}
+
+func (h *textHandler) Handle(_ context.Context, r slog.Record) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	line := fmt.Sprintf("time=%s level=%s msg=%s",
+		r.Time.Format(timeFormat), h.levelToken(r.Level), quoteMessage(r.Message))
+	r.Attrs(func(a slog.Attr) bool {
+		line += " " + a.Key + "=" + a.Value.String()
+		return true
+	})
+	_, err := io.WriteString(h.w, line+"\n")
+	return err
+}
+
+func (h *textHandler) WithAttrs(_ []slog.Attr) slog.Handler { return h }
+func (h *textHandler) WithGroup(_ string) slog.Handler      { return h }
+
+// levelToken renders the level marker, colorized unless the sink includes a
+// file (ANSI escapes in a log file are noise).
+func (h *textHandler) levelToken(level slog.Level) string {
+	if !h.colorize {
+		return level.String()
+	}
+	return levelColor(level) + level.String() + ansiReset
+}
+
+func levelColor(level slog.Level) string {
+	switch {
+	case level >= slog.LevelError:
+		return ansiRed
+	case level >= slog.LevelWarn:
+		return ansiYellow
+	case level >= slog.LevelInfo:
+		return ansiGreen
+	default:
+		return ansiGray
+	}
+}
+
+// quoteMessage quotes multi-word messages so one line stays one record.
+func quoteMessage(msg string) string {
+	if strings.ContainsAny(msg, " \t") {
+		return strconv.Quote(msg)
+	}
+	return msg
+}
+
+// sensitiveHeaders are redacted in dumps and request logs; keys are compared
+// lower-cased so direct (non-canonical) header assignments are covered too.
+var sensitiveHeaders = map[string]struct{}{
+	"authorization": {},
+	"x-api-key":     {},
+	"cookie":        {},
+	"set-cookie":    {},
+}
+
+// RedactHeaders returns a copy of h with the values of sensitive headers
+// (Authorization, x-api-key, Cookie, Set-Cookie) replaced by "[redacted]".
+// The input header is not modified.
+func RedactHeaders(h http.Header) map[string][]string {
+	out := make(map[string][]string, len(h))
+	for k, vs := range h {
+		copied := make([]string, len(vs))
+		copy(copied, vs)
+		if _, sensitive := sensitiveHeaders[strings.ToLower(k)]; sensitive {
+			for i := range copied {
+				copied[i] = "[redacted]"
+			}
+		}
+		out[k] = copied
+	}
+	return out
+}
+
+// dumpBodyLimit truncates dumped bodies, mirroring the upstream client.
+const dumpBodyLimit = 20000
+
+// DumpRequest writes a debug record for one HTTP request to ./dump/ when
+// enabled, mirroring the upstream client's dump format:
+// `<kind>-<unixnano>-<sanitized-path>.dump`, mode 0600, sensitive headers
+// redacted, body truncated to 20000 bytes. This is the server-layer helper
+// (the upstream client dumps its own traffic independently on DEBUG_DUMP).
+func DumpRequest(kind string, req *http.Request, status int, body string, enabled bool) {
+	if !enabled || req == nil {
+		return
+	}
+	name := fmt.Sprintf("%s-%d-%s.dump", kind, time.Now().UnixNano(), sanitizeName(reqPath(req)))
+	path := filepath.Join("dump", name)
+	_ = os.MkdirAll("dump", 0o755)
+
+	var buf bytes.Buffer
+	buf.WriteString(fmt.Sprintf("%s %s\n", req.Method, req.URL.String()))
+	for k, vs := range RedactHeaders(req.Header) {
+		for _, v := range vs {
+			buf.WriteString(fmt.Sprintf("%s: %s\n", k, v))
+		}
+	}
+	buf.WriteString(fmt.Sprintf("\n[status %d]\n%s\n", status, truncate(body, dumpBodyLimit)))
+	_ = os.WriteFile(path, buf.Bytes(), 0o600)
+}
+
+func reqPath(req *http.Request) string {
+	if req.URL != nil {
+		return req.URL.Path
+	}
+	return ""
+}
+
+func sanitizeName(p string) string {
+	p = strings.ReplaceAll(p, "/", "_")
+	p = strings.ReplaceAll(p, ".", "_")
+	if len(p) > 60 {
+		p = p[:60]
+	}
+	return p
+}
+
+func truncate(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n] + "..."
+}
