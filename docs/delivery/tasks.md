@@ -70,3 +70,4 @@ Ordered risk-first; each slice is independently verifiable with `go test ./...` 
 3. **`-race` needs a C toolchain** — no gcc on the dev machine; race runs happen in CI (Linux).
 4. **`GOTMPDIR`** — pointing it at `%TEMP%\opencode\gotmp` reduces AV interference on local test runs (not a full fix; the `-c` workaround above is the reliable one).
 5. **Subagent note** — the `implementor`/`build` agent types returned empty results in this environment; the `general` agent type worked reliably for all build slices.
+6. **Observability pass (2026-08-12)** — `LOG_LEVEL` config (debug/info/warn/error, wins over `-v`), telemetry `New`/`ParseLevel`, server access-log middleware (Info: method/path/status/ms/remote), upstream `do()` Debug lines, session/runs/pool lifecycle Debug lines, `.env.example` + README config table/troubleshooting updated.
