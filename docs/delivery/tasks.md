@@ -51,11 +51,15 @@ Ordered risk-first; each slice is independently verifiable with `go test ./...` 
 - [x] CI via GitHub Actions (`.github/workflows/ci.yml`): build, vet, `go test -race ./...`, `go mod verify` on ubuntu-latest — **green**, and it caught 5 race-detector findings on its first run (see Slice 3 defects)
 - [x] Docker build smoke — **verified on vps-01** (Ubuntu 24.04, Docker 29.7.2): `docker compose up --build` → container healthy, `/healthz` 200, `/v1/models` serving the live-parsed registry (27 agents / 12 models from Codebuff TS sources), full chat path exercised (dummy token → upstream 404 → clean 502 mapping). Image: 26MB (7.18MB uncompressed layers).
 
-## Live verification (blocked on user)
+## Live verification (in progress — token provided 2026-08-11)
 
-- [ ] User provides FreeBuff token (+ clean egress IP if geo-blocked)
-- [ ] A/B: `COST_MODE` omit vs `free`, Buffy preamble on/off, `client_id` formats → settle defaults (PRD §8)
-- [ ] Real upstream smoke: stream, non-stream, waiting room, model list
+- [x] User provides FreeBuff token — done (local `.env` + VPS `.env`, both gitignored)
+- [x] Real upstream smoke — **PASSED**: non-stream ✅, streaming SSE ✅ (reasoning_content preserved, [DONE]), model list ✅, live registry refresh (27 agents / 12 models) ✅, waiting room not yet observed
+- [x] Deployment — VPS (vps-01) Docker container running with the real token; Azure datacenter IP gets **limited mode** (6 sessions/day, 2 models), not a hard block
+- [x] **Defect found by live testing**: upstream `do()` deferred-cancel killed streamed response bodies → 502 "context canceled" right after a 200. Fixed (cancel ownership moved to callers, `cancelBody` wrapper, regression test). This bug was invisible to mock tests — live traffic exposed it.
+- [ ] A/B: `COST_MODE` omit vs `free` (upstream `costModes` includes 'free' — valid syntax), Buffy preamble on/off, `client_id` formats → settle defaults (PRD §8)
+- [ ] Wait: observe a waiting-room (`503 + Retry-After`) and a session rotation in real traffic
+- [ ] Research complete → `docs/research/freebuff-limitations.md` (session quotas, model-bound sessions, GLM 5/20h, ToS, ads-dead). Follow-up: per-(token, model) session cache (model switches burn quota today).
 
 ---
 

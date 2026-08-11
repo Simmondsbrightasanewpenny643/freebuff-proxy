@@ -1,0 +1,72 @@
+# FreeBuff / Codebuff free tier — limitations & quota research
+
+**Date**: 2026-08-11 · **Status**: research complete (web + upstream source + commit history)
+**Sources**: freebuff.com, freebuff.com/terms-of-service (2026-07-23), npm registry `freebuff`,
+CodebuffAI/codebuff GitHub (commit `7dd903b`, issue #504), live upstream constants
+(`free-agents.ts`, `model-config.ts`) and live API behavior observed via this proxy.
+
+---
+
+## 1. Session quotas (the "max 6 sessions" your account showed)
+
+Sessions are **one-hour, model-bound** units. The quota depends on access tier:
+
+| Tier | Models | Session quota | Notes |
+|---|---|---|---|
+| **Limited mode** (outside the 25+ full-access countries, or **VPN/datacenter IPs**) | DeepSeek V4 Flash (07/31), MiMo 2.5 | **6 one-hour sessions per day** | What your web UI showed ("max 6 session avail") |
+| **Full mode** | DeepSeek V4 Flash (07/31, CLI default), DeepSeek V4 Pro, GPT-5.6 Luna, MiniMax M3, MiMo 2.5, Kimi K2.7 Code | ~5 one-hour sessions/day for premium models (issue #504, 2026-04: "5 sessions of one hour each for the premium models, and currently unlimited of MiniMax M2.7") | MiniMax exempt from the 20h window |
+| **GLM 5.2** (earned sessions) | z-ai/glm-5.2 | **5 per 20 hours**, enforced with HTTP 429 `rate_limited` (commit `7dd903b`, 2026-04-22) | Response carries `rateLimit` quota: "N / 5 used in last 20h" |
+| Gemini 3.1 Flash Lite | google/gemini-3.1/3.5-flash-lite | specialist subagents only (file finding/research) | not user-pickable directly |
+
+- Queued→active transitions are audited (`free_session_admit` audit log).
+- Sessions are **model-locked**: a turn resolved to a different model than the session is rejected
+  with `session_model_mismatch` (observed in upstream `free-agents.ts` comments). The official
+  CLI admits one session per model; switching models ends/creates a session.
+- **Ads no longer grant credits** (issue #504, 2026-04, jahooma: "ads no longer give credits…
+  I turned it off") — kiprana's ad-impression integration is obsolete upstream.
+
+## 2. What this means for freebuff-proxy
+
+1. **One token ≈ 6 sessions/day (limited) or ~5/day (full premium) in practice.** Each session
+   lasts 1h. Our pool creates a session lazily per token and caches it; the quota is burned by
+   session CREATES, not by requests within a session. Keep usage modest.
+2. **Model-bound sessions vs our shared session.** The proxy currently caches ONE session per
+   token and shares it across models. Upstream rejects model switches with
+   `session_model_mismatch`; the recovery matrix now treats that as session-invalid →
+   invalidate + recreate + retry once (added 2026-08-11). Cost: every model switch burns a
+   fresh session from the daily quota. **Future work**: cache sessions per (token, model) so a
+   working session is reused until it expires.
+3. **429 `rate_limited`** (GLM) is passed through verbatim by the error matrix (UpstreamError
+   with 429 → client sees 429 + Retry-After where present). The proxy does not track the
+   "N / 5 in 20h" quota yet — surfaced only in upstream error bodies.
+4. **Geo-gating is tier-based, not request-based.** A datacenter/VPN IP puts the account in
+   limited mode (6 sessions, 2 models) rather than outright blocking — observed live: this
+   proxy on an Azure VPS IP served DeepSeek V4 Flash successfully. The 402/403 errors in the
+   reference docs predate the tier rollout. `HTTP_PROXY`/`SOCKS5_PROXY` still matter for
+   unlocking full mode from blocked countries.
+5. **cost_mode**: upstream `model-config.ts` defines `costModes = ['free','lite','normal',
+   'max','experimental','ask']` — `"free"` is a legitimate value, which supports the
+   freebuff2api/kiprana evidence (PRD §8 A/B still open, but "free" is valid syntax).
+
+## 3. ToS constraints (freebuff.com/terms-of-service, 2026-07-23)
+
+- Free access is per **person**, one account per person; no multi-account farming.
+- Explicitly prohibited: "Access free AI model inference except through normal use of an
+  official Company product… You may not call the underlying servers or endpoints directly or
+  through scripts, custom clients, wrappers, integrations, or third-party software."
+- "A human must initiate each session and remain actively present while it runs."
+- "Hide, spoof, or misrepresent your actual country or location, including by using a proxy,
+  VPN, relay…" to obtain different models/limits.
+- **Verdict**: a community proxy like this one violates the letter of the ToS (undocumented
+  endpoints + wrapper access). This project is explicitly educational/personal (PRD §8.6,
+  README Terms of use). Account bans are possible; keep usage modest.
+
+## 4. Open items (still worth a live A/B)
+
+- [ ] Confirm current full-mode quota per model with a real account (5/day for premium; MiniMax
+      truly unlimited? GLM 5/20h confirmed by commit).
+- [ ] `COST_MODE` omit vs `"free"` — 'free' is valid upstream syntax; A/B with a real token.
+- [ ] Buffy system-prompt preamble — kiprana-only claim; verify against current CLI HAR.
+- [ ] Does the session create endpoint bind the model via `x-freebuff-model` header? (Our
+      CreateSession sends `{}` with no model header; if binding happens, the shared-session
+      design must become per-(token,model) — see §2.2.)

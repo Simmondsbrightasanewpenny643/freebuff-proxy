@@ -83,12 +83,13 @@ Package layout (Go, stdlib-first):
 
 ## 8. Open questions (must resolve empirically)
 
-1. ❓ **`cost_mode`**: omit (proxy-freebuff, 2026-08 evidence) vs `"free"` (Go+Python repos). → CLI flag/env `COST_MODE`; live A/B with real token; bake winner as default.
+1. ❓ **`cost_mode`**: omit (proxy-freebuff, 2026-08 evidence) vs `"free"` (Go+Python repos). Upstream `model-config.ts` defines `costModes = ['free','lite','normal','max','experimental','ask']` — "free" is valid syntax. → CLI flag/env `COST_MODE`; live A/B with real token; bake winner as default.
 2. ❓ Buffy system-prompt preamble + `cache_control` — kiprana-only. A/B with cost_mode test.
 3. ❓ `client_id` format: 13-char base36 (SDK-faithful, Go) — default this; A/B only if 403s appear.
 4. ❓ `www.codebuff.com` vs `codebuff.com` — follow `www.` redirect, normalize in config.
-5. ⚠️ Live verification needs: a FreeBuff token (user-supplied) + clean residential egress (geo-gating).
-6. ⚠️ ToS risk: undocumented endpoints; bans possible. Educational use.
+5. ❓ **Session quota**: limited mode = 6 one-hour sessions/day (2 models); full mode ≈ 5/day premium (MiniMax unlimited); GLM = 5/20h (429 rate_limited). Sessions are model-bound (`session_model_mismatch`). Known limitation: the proxy caches one session per token shared across models — model switches burn quota (recovery recreates). Future: per-(token, model) session cache. See `docs/research/freebuff-limitations.md`.
+6. ⚠️ Live verification needs: a FreeBuff token (user-supplied) + clean residential egress (geo-gating is tier-based now — datacenter IPs get limited mode, not a hard block).
+7. ⚠️ ToS risk: undocumented endpoints; bans possible. Educational use. Note: ads no longer grant credits upstream (2026-04) — kiprana's ad path is obsolete.
 
 ## 9. Out of scope this iteration (recorded)
 
