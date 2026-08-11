@@ -1,9 +1,11 @@
 # FreeBuff / Codebuff free tier — limitations & quota research
 
-**Date**: 2026-08-11 · **Status**: research complete (web + upstream source + commit history)
+**Date**: 2026-08-12 · **Status**: research complete (web + upstream source + commit history + 6 reference implementations + live 429)
 **Sources**: freebuff.com, freebuff.com/terms-of-service (2026-07-23), npm registry `freebuff`,
-CodebuffAI/codebuff GitHub (commit `7dd903b`, issue #504), live upstream constants
-(`free-agents.ts`, `model-config.ts`) and live API behavior observed via this proxy.
+CodebuffAI/codebuff GitHub (commits `7dd903b`, `793de91d9aaa`, PRs #566/#598/#657, issue #504),
+live upstream constants (`free-agents.ts`, `model-config.ts`), live API behavior observed via this
+proxy, and the reference implementations in `reference/` (proxy-freebuff, freebuff2api-quorinex,
+freebuff2api-miladnoo, freebuff-api-kiprana, freebuff-gateway, free-buff-lol).
 
 ---
 
@@ -71,6 +73,50 @@ Sessions are **one-hour, model-bound** units. The quota depends on access tier:
   `codebuff_metadata {run_id, client_id, freebuff_instance_id}` only.
 - Waiting room: `queued` → proxy returns `503 + Retry-After`; the pool's 60s maintain ticker
   advances queued sessions in the background. Not yet observed in live traffic (2026-08-11).
+
+## 2c. Quota accounting — exact mechanics (2026-08-12, upstream source confirmed)
+
+- **Quota is burned by the ADMISSION transition (queued→active), not by POST /session.**
+  POST is an *upsert* into the `free_session` table (PK user_id): an existing active+unexpired
+  row is returned as-is without burning quota (CodebuffAI/codebuff PR #598). A 429 is a
+  **pre-check rejection** — it never creates an admit row, so failed attempts while
+  rate-limited do NOT deepen the limit (commit `7dd903b`).
+- **The quota unit is `session_units` (numeric(3,1))**, not a raw count: 1.0 per admission,
+  reduced when a session ends early. Live `recentCount: 6.6` = 6 full sessions + a ~36-min
+  partial. Ending a session early partially REFUNDS quota (schema comment, commit `793de91d9aaa`).
+- **Scope**: limited-tier daily quota (6) is per-**account**, shared across the 2 limited
+  models (the `model` field in the 429 body identifies the requested model, not a per-model
+  bucket). Full-access premium is also account-shared. Separate per-model quotas exist for
+  GLM (5/20h) and Gemini Pro (1/24h); MiniMax is unlimited (PRs #566/#657).
+- **Agent-runs START does NOT consume session quota**; chat requests inside an active session
+  cost zero. Sessions are the only burn vector.
+- **429 body carries the full reset contract**: `retryAfterMs`, `resetAt` (ISO, Pacific
+  midnight for the daily bucket), `limit`, `recentCount`, `period`, `accessTier`.
+
+## 2d. Reference-implementation consensus (proxy-freebuff, quorinex, miladnoo, kiprana,
+free-buff-lol, freebuff2api-optimized, freebuff2api-wokers, freebuff-proxy-hengxin, 2026-08-12)
+
+- **GET-before-POST is universal**: every implementation polls/reuses a cached session and
+  only POSTs when none exists/ended/superseded. 5s (or 60s) expiry margin is standard.
+- **None of them cooldown on 429** (only 401→30min auth cooldown) — a 429-aware cooldown
+  keyed by `retryAfterMs`/`resetAt` would be the first of its kind. The wokers worker parses
+  `retryAfterMs` (regex, capped 6h) and hengxin surfaces `Retry-After` to clients; the
+  Go/Python implementations ignore the body entirely.
+- **The quota-exhaustion failure mode on 9router** (observed live 2026-08-12): our 502
+  mapping → 9router fixed 30s account lock + 3 executor retries @3s → hammering. A 429 +
+  Retry-After response triggers 9router's exponential backoff (2s→5min) instead — the
+  correct response for "quota gone until resetAt".
+- **Our proxy's quota leak (fixed 2026-08-12)**: the 60s maintain loop called
+  `EnsureSession`, which POSTs a fresh session when none exists or the cached one expired
+  (1h). An idle container burned ~1 session/hour of uptime — a 6/day account was exhausted
+  in ~6 hours of uptime with zero traffic. Fix: maintain advances *queued* sessions only
+  (GET, zero cost); session creation is lazy on first request.
+- **Hot-session-first scheduling** (hengxin/wokers): when multiple tokens exist, prefer the
+  token holding a live same-model session — never create on an account that already has one.
+  Future work for our multi-token pool (single-token deployments are already optimal).
+- **Per-(token, model) session cache** (optimized/wokers) with a 30s verify window: avoids
+  re-verifying during bursts. Future work; our shared per-token session is validated live
+  (one instance served 9+ requests across 6 models).
 
 ## 3. ToS constraints (freebuff.com/terms-of-service, 2026-07-23)
 
