@@ -28,8 +28,8 @@ codebuff.com (FreeBuff free tier — token-bound)
 3. Verify before touching 9router:
 
    ```bash
-   curl http://127.0.0.1:3457/healthz     # {"models":12,"tokens":[...],"uptime_seconds":N}
-   curl http://127.0.0.1:3457/v1/models   # the 12-model catalog
+   curl http://127.0.0.1:3457/healthz     # {"models":15,"tokens":[...],"uptime_seconds":N}
+   curl http://127.0.0.1:3457/v1/models   # the model catalog (~15 at boot)
    ```
 
 **Base URL — which one to use in 9router:** the proxy listens on port **3457**; only the
@@ -109,7 +109,7 @@ Data lives in `~/.9router/` (SQLite). Default port: **20128** (dashboard `/dashb
    | **API Type** | **Chat Completions** | Keep the default `chat`. The proxy implements `/v1/chat/completions` only — **Responses API is NOT supported**; choosing it makes every request 404 |
    | **Base URL** | **default: `http://127.0.0.1:3457/v1`** — see the host table in §1; if 9router runs **in Docker**, use `http://<docker-gateway>:3457/v1` instead (detected automatically by `scripts/setup-proxy-docker.sh`) | Must end in `/v1` — 9router appends `/models`, `/chat/completions` to it |
    | **API Key (for Check)** | any non-empty value (e.g. the FreeBuff token) | Used ONLY by the **Check** button. The **Create** button does not require it. With an empty proxy `API_KEYS`, any value passes |
-   | **Model ID (optional)** | **leave empty** | Only for providers *without* a `/models` endpoint (falls back to a chat-completions inference test). The proxy has `GET /v1/models` — the /models check succeeds and enumerates all 12 models |
+   | **Model ID (optional)** | **leave empty** | Only for providers *without* a `/models` endpoint (falls back to a chat-completions inference test). The proxy has `GET /v1/models` — the /models check succeeds and enumerates the catalog (15 models at boot) |
    | **Check** button | click it → expect a green **Valid** badge | 9router POSTs `/api/provider-nodes/validate` → `GET {base}/models` with your key, 10s timeout. Green = proxy reachable |
    | **Create** button | click it | POSTs `/api/provider-nodes` `{name, prefix, apiType:"chat", baseUrl, type:"openai-compatible"}` — does NOT run the URL check |
 
@@ -152,7 +152,7 @@ store is the same object it persists in its DB):
 
 ---
 
-## 4. Model catalog (live, 2026-08-11)
+## 4. Model catalog (boot fallback, 2026-08-12)
 
 Served by `GET /v1/models` (parsed from `CodebuffAI/codebuff` TS sources, refreshed every 6h,
 fallback at boot). Register any subset in 9router:
@@ -165,10 +165,16 @@ fallback at boot). Register any subset in 9router:
 | `minimax/minimax-m3` | full access; fast + image support |
 | `mimo/mimo-v2.5` | full **and** limited access |
 | `z-ai/glm-5.2` | earned sessions; **rate-limited to 5 sessions / 20h** (HTTP 429 `rate_limited`) |
-| `crof/kimi-k3-eco`, `anthropic/claude-fable-5`, `meta/muse-spark-1.2-contributor` | catalog additions, may be restricted per tier |
+| `poolside/laguna-s-2.1`, `openrouter/poolside/laguna-s-2.1` | catalog additions since 2026-08 — pending tier probing |
+| `inclusionai/ling-3.0-flash:free` | catalog addition — pending tier probing |
+| `crof/greg-2-ultra`, `crof/greg-2-super` | catalog additions — pending tier probing |
+| `anthropic/claude-fable-5` | catalog addition; may be restricted per tier |
 | `google/gemini-2.5/3.1/3.5-flash-lite` | specialist subagents (file finding/research) — not a general chat model |
 
-Quota reality (see `docs/research/freebuff-limitations.md`):
+> The live catalog refreshes every 6h and can differ slightly from this boot fallback —
+> always trust `GET /v1/models` for the current list.
+
+Quota reality (local dev note: `docs/research/freebuff-limitations.md`, gitignored):
 - **Limited mode** (some regions / VPN / datacenter IPs): DeepSeek V4 Flash + MiMo 2.5 only,
   6 one-hour sessions/day.
 - **Full mode**: all models; ~5 one-hour sessions/day for premium models (MiniMax unlimited,
@@ -220,8 +226,8 @@ Also verify in the 9router dashboard chat: pick `freebuff/deepseek-v4-flash` and
 
 ## 7. References
 
-- This project: `docs/product/prd.md`, `docs/research/freebuff-reference-analysis.md`,
-  `docs/research/freebuff-limitations.md`, README (getting a token, config table)
+- This project: README (getting a token, config table), this guide — the PRD, reference
+  analysis and quota-research notes are **local-only dev docs** (gitignored)
 - 9router: github.com/decolua/9router (`npm i -g 9router`, dashboard on :20128, data in
   `~/.9router/`)
 - ToS note: FreeBuff's terms prohibit third-party wrappers/endpoints — educational/personal
