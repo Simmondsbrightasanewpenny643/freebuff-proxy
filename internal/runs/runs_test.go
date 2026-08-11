@@ -50,7 +50,9 @@ func eventually(t *testing.T, what string, cond func() bool) {
 }
 
 func finishedRun(mock *testutil.MockUpstream, runID string) (testutil.FinishedRun, bool) {
-	for _, f := range mock.FinishedRuns {
+	// Snapshot under the mock's lock: FINISH arrives from a background
+	// goroutine while the test polls (eventually), so raw field reads race.
+	for _, f := range mock.FinishedRunsSnapshot() {
 		if f.RunID == runID {
 			return f, true
 		}

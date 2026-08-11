@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"strings"
 	"sync"
 	"testing"
@@ -300,6 +301,151 @@ func TestDisabledSessionLease(t *testing.T) {
 	p.LeaseRelease(lease)
 }
 
+func TestInvalidateSessionRecreates(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	p := newTestPool(t, mock)
+
+	lease, err := p.Acquire(context.Background(), modelA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p.LeaseRelease(lease)
+	if mock.SessionCreates != 1 {
+		t.Fatalf("session creates = %d, want 1", mock.SessionCreates)
+	}
+
+	p.InvalidateSession(lease.Token)
+	lease2, err := p.Acquire(context.Background(), modelA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p.LeaseRelease(lease2)
+	if mock.SessionCreates != 2 {
+		t.Errorf("session creates = %d, want 2 (recreated after invalidate)", mock.SessionCreates)
+	}
+	if lease2.SessionInstanceID != "inst-abc-123" {
+		t.Errorf("recreated instance = %q, want inst-abc-123", lease2.SessionInstanceID)
+	}
+
+	// Out-of-range tokens are ignored without panicking.
+	p.InvalidateSession(-1)
+	p.InvalidateSession(99)
+}
+
+func TestInvalidateRunRestarts(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	p := newTestPool(t, mock)
+
+	lease, err := p.Acquire(context.Background(), modelA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p.LeaseRelease(lease)
+	if len(mock.StartedRuns) != 1 {
+		t.Fatalf("started runs = %v, want 1", mock.StartedRuns)
+	}
+
+	p.InvalidateRun(lease.Token, lease.AgentID)
+	lease2, err := p.Acquire(context.Background(), modelA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p.LeaseRelease(lease2)
+	if len(mock.StartedRuns) != 2 {
+		t.Errorf("started runs = %d, want 2 (restart after invalidate)", len(mock.StartedRuns))
+	}
+	if len(mock.FinishedRuns) != 0 {
+		t.Errorf("finished runs = %v, want none (invalidated run is not FINISHed)", mock.FinishedRuns)
+	}
+
+	// Out-of-range tokens are ignored without panicking.
+	p.InvalidateRun(-1, agentA)
+	p.InvalidateRun(99, agentA)
+}
+
+func TestCooldownToken(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	p := newTestPool(t, mock)
+
+	p.CooldownToken(0, time.Hour)
+	snap := p.Snapshot()[0]
+	if snap.CooldownUntil.Before(time.Now().Add(59 * time.Minute)) {
+		t.Errorf("cooldown until = %v, want ~now+1h", snap.CooldownUntil)
+	}
+
+	_, err := p.Acquire(context.Background(), modelA)
+	if err == nil {
+		t.Fatal("want error while the only token is cooling down")
+	}
+	if !strings.Contains(err.Error(), "cooling down") {
+		t.Errorf("error = %q, want cooldown message", err)
+	}
+
+	// Out-of-range tokens are ignored without panicking.
+	p.CooldownToken(99, time.Hour)
+	p.CooldownToken(-1, time.Hour)
+}
+
+func TestPoolChat(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	mock.ChatBody = testutil.SSEEvent(`{"id":"chatcmpl-1","object":"chat.completion.chunk","created":1,"model":"` + modelA + `","choices":[{"index":0,"delta":{"content":"hi"},"finish_reason":"stop"}]}`)
+	p := newTestPool(t, mock)
+
+	lease, err := p.Acquire(context.Background(), modelA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer p.LeaseRelease(lease)
+
+	opts := upstream.ChatOptions{Model: modelA, RunID: lease.Run.RunID, SessionInstanceID: lease.SessionInstanceID}
+	body := []byte(`{"model":"` + modelA + `","messages":[{"role":"user","content":"ping"}]}`)
+	rc, err := p.Chat(context.Background(), lease, opts, body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := io.ReadAll(rc)
+	rc.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(got), `"content":"hi"`) {
+		t.Errorf("stream = %q, want content chunk", got)
+	}
+
+	// The chat went out with the CLI envelope on the leased token.
+	if len(mock.RecordedChatBodies) != 1 {
+		t.Fatalf("upstream chat calls = %d, want 1", len(mock.RecordedChatBodies))
+	}
+	recorded := mock.RecordedChatBodies[0]
+	for _, want := range []string{`"codebuff_metadata"`, `"data_collection":"deny"`, `"stream":true`, `"stop":["cb_easp"]`} {
+		if !strings.Contains(recorded, want) {
+			t.Errorf("upstream body missing %s: %s", want, recorded)
+		}
+	}
+	if !strings.Contains(recorded, `"run_id":"run-0001"`) {
+		t.Errorf("upstream body missing the leased run id: %s", recorded)
+	}
+	h := mock.RecordedChatHeaders[0]
+	if got := h.Get("x-freebuff-model"); got != modelA {
+		t.Errorf("x-freebuff-model = %q, want %q", got, modelA)
+	}
+	if got := h.Get("x-freebuff-instance-id"); got != "inst-abc-123" {
+		t.Errorf("x-freebuff-instance-id = %q, want inst-abc-123", got)
+	}
+
+	// Invalid leases fail without panicking.
+	if _, err := p.Chat(context.Background(), nil, opts, body); err == nil {
+		t.Error("want error for nil lease")
+	}
+	if _, err := p.Chat(context.Background(), &Lease{Token: 99}, opts, body); err == nil {
+		t.Error("want error for out-of-range lease token")
+	}
+}
+
 func TestUnknownModel(t *testing.T) {
 	mock := testutil.NewMock()
 	defer mock.Close()
@@ -329,15 +475,15 @@ func TestStartPrewarmsAndShutdownDrains(t *testing.T) {
 	// STARTed run.
 	agentCount := len(p.regAgentIDs(t))
 	eventually(t, "prewarm of all agents", func() bool {
-		return len(mock.StartedRuns) >= agentCount
+		return len(mock.StartedRunsSnapshot()) >= agentCount
 	})
 
 	p.Shutdown(context.Background())
 
 	eventually(t, "shutdown drain FINISHes", func() bool {
-		return len(mock.FinishedRuns) >= agentCount
+		return len(mock.FinishedRunsSnapshot()) >= agentCount
 	})
-	for _, f := range mock.FinishedRuns {
+	for _, f := range mock.FinishedRunsSnapshot() {
 		if f.Status != "completed" {
 			t.Errorf("run %s finished with status %q, want completed", f.RunID, f.Status)
 		}

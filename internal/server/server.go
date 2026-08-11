@@ -1,0 +1,416 @@
+// Package server exposes the OpenAI-compatible HTTP surface of the
+// freebuff-proxy bridge: POST /v1/chat/completions (stream + non-stream),
+// GET /v1/models, and GET /healthz. Stdlib only.
+//
+// Responsibilities (PRD §6 error matrix):
+//   - optional client auth (Bearer / x-api-key exact match, constant-time)
+//   - request sanitization via internal/convert before the upstream call
+//   - retry-once recovery for session-invalid / run-invalid chat errors
+//   - 30-min token cooldown on upstream auth rejection
+//   - error mapping to the OpenAI error shape, 503 + Retry-After for the
+//     waiting room, 502 when every token is exhausted
+//   - SSE relay (sanitized chunks + [DONE]) and non-streaming accumulation
+//   - client-disconnect propagation to the upstream (request context)
+package server
+
+import (
+	"bufio"
+	"context"
+	"crypto/subtle"
+	"encoding/json"
+	"errors"
+	"io"
+	"log/slog"
+	"math"
+	"net/http"
+	"strconv"
+	"strings"
+	"time"
+
+	"freebuff-proxy/internal/config"
+	"freebuff-proxy/internal/convert"
+	"freebuff-proxy/internal/pool"
+	"freebuff-proxy/internal/registry"
+	"freebuff-proxy/internal/runs"
+	"freebuff-proxy/internal/session"
+	"freebuff-proxy/internal/upstream"
+)
+
+const (
+	// maxRequestBody caps the inbound chat-completions body (32MB).
+	maxRequestBody = 32 << 20
+	// maxStreamLine caps one upstream SSE line the scanner will buffer.
+	maxStreamLine = 16 << 20
+)
+
+// Server is the HTTP handler holder: routes are built by Handler().
+type Server struct {
+	cfg     *config.Config
+	pool    *pool.Pool
+	reg     *registry.Registry
+	logger  *slog.Logger
+	started time.Time
+}
+
+// New builds the server over the configured pool and registry. A nil logger
+// falls back to slog.Default(). The started timestamp pins /v1/models
+// "created" and /healthz uptime.
+func New(cfg *config.Config, p *pool.Pool, reg *registry.Registry, logger *slog.Logger) *Server {
+	if logger == nil {
+		logger = slog.Default()
+	}
+	return &Server{cfg: cfg, pool: p, reg: reg, logger: logger, started: time.Now()}
+}
+
+// Handler returns the route table. Method mismatches and unknown paths get
+// the ServeMux's automatic 405/404.
+func (s *Server) Handler() http.Handler {
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v1/chat/completions", s.requireAuth(s.handleChat))
+	mux.HandleFunc("GET /v1/models", s.requireAuth(s.handleModels))
+	mux.HandleFunc("GET /healthz", s.handleHealthz)
+	return mux
+}
+
+// --- auth ---
+
+// requireAuth wraps a handler with client-auth enforcement. When no API keys
+// are configured the handler passes through untouched; /healthz is always
+// exempt (the caller wires it without requireAuth).
+func (s *Server) requireAuth(next http.HandlerFunc) http.HandlerFunc {
+	if len(s.cfg.APIKeys) == 0 {
+		return next
+	}
+	return func(w http.ResponseWriter, r *http.Request) {
+		if !s.authorized(r) {
+			s.writeJSONError(w, http.StatusUnauthorized,
+				"Invalid API key", "invalid_request_error", "invalid_api_key", 0)
+			return
+		}
+		next(w, r)
+	}
+}
+
+// authorized reports whether the request carries a configured API key,
+// either as "Authorization: Bearer <key>" or "x-api-key: <key>". Comparison
+// is constant-time against every configured key.
+func (s *Server) authorized(r *http.Request) bool {
+	provided := ""
+	if h := r.Header.Get("Authorization"); strings.HasPrefix(h, "Bearer ") {
+		provided = strings.TrimPrefix(h, "Bearer ")
+	} else if h := r.Header.Get("x-api-key"); h != "" {
+		provided = h
+	}
+	if provided == "" {
+		return false
+	}
+	for _, key := range s.cfg.APIKeys {
+		if subtle.ConstantTimeCompare([]byte(provided), []byte(key)) == 1 {
+			return true
+		}
+	}
+	return false
+}
+
+// --- chat ---
+
+// handleChat is the OpenAI chat-completions entry point: sanitize the
+// request, acquire a token lease, call upstream with retry-once recovery,
+// then relay the forced stream to the client (SSE or accumulated JSON).
+func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+
+	r.Body = http.MaxBytesReader(w, r.Body, maxRequestBody)
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		var mbe *http.MaxBytesError
+		if errors.As(err, &mbe) {
+			s.writeJSONError(w, http.StatusRequestEntityTooLarge,
+				"request body exceeds the 32MB limit", "invalid_request_error", "content_too_large", 0)
+		} else {
+			s.writeJSONError(w, http.StatusBadRequest,
+				"failed to read request body: "+err.Error(), "invalid_request_error", "invalid_json", 0)
+		}
+		return
+	}
+
+	// The raw map decides the response mode (stream) before sanitization.
+	var raw map[string]any
+	if err := json.Unmarshal(body, &raw); err != nil {
+		s.writeJSONError(w, http.StatusBadRequest,
+			"request body must be a valid JSON object", "invalid_request_error", "invalid_json", 0)
+		return
+	}
+	model, _ := raw["model"].(string)
+	if model == "" {
+		s.writeJSONError(w, http.StatusBadRequest,
+			"missing required field \"model\"; available: "+strings.Join(s.reg.Models(), ", "),
+			"invalid_request_error", "model_not_found", 0)
+		return
+	}
+	stream := false
+	if v, ok := raw["stream"].(bool); ok {
+		stream = v
+	}
+
+	normalized, err := convert.NormalizeRequest(body)
+	if err != nil {
+		s.writeJSONError(w, http.StatusBadRequest,
+			"request body must be a valid JSON object: "+err.Error(), "invalid_request_error", "invalid_json", 0)
+		return
+	}
+
+	lease, err := s.pool.Acquire(ctx, model)
+	if err != nil {
+		s.writeError(w, r, err)
+		return
+	}
+
+	opts := upstream.ChatOptions{
+		Model:             model,
+		RunID:             lease.Run.RunID,
+		SessionInstanceID: lease.SessionInstanceID,
+	}
+
+	released := false
+	release := func() {
+		if !released {
+			released = true
+			s.pool.LeaseRelease(lease)
+		}
+	}
+	defer release()
+
+	var up io.ReadCloser
+	attempts := 0
+	for {
+		up, err = s.pool.Chat(ctx, lease, opts, normalized)
+		if err == nil {
+			break
+		}
+		attempts++
+		switch {
+		case errors.Is(err, upstream.ErrSessionInvalid):
+			release()
+			s.pool.InvalidateSession(lease.Token)
+		case errors.Is(err, upstream.ErrRunInvalid):
+			release()
+			s.pool.InvalidateRun(lease.Token, lease.AgentID)
+		case errors.Is(err, upstream.ErrAuthRejected):
+			s.pool.CooldownToken(lease.Token, runs.DefaultCooldown)
+			release()
+			s.writeError(w, r, err)
+			return
+		default:
+			release()
+			s.writeError(w, r, err)
+			return
+		}
+		if attempts > 1 {
+			s.writeError(w, r, err)
+			return
+		}
+		lease, err = s.pool.Acquire(ctx, model)
+		if err != nil {
+			s.writeError(w, r, err)
+			return
+		}
+		released = false
+		opts.RunID = lease.Run.RunID
+		opts.SessionInstanceID = lease.SessionInstanceID
+	}
+	defer up.Close()
+
+	s.logger.Debug("chat upstream ok",
+		"token", lease.Token+1, "model", model, "stream", stream)
+
+	if stream {
+		s.relayStream(ctx, w, up)
+	} else {
+		s.relayJSON(ctx, w, up)
+	}
+}
+
+// relayStream forwards sanitized upstream SSE lines to the client with
+// per-chunk flushing, a [DONE] terminator, and an error chunk (then DONE)
+// when the upstream stream dies while the client context is still live.
+func (s *Server) relayStream(ctx context.Context, w http.ResponseWriter, r io.Reader) {
+	h := w.Header()
+	h.Set("Content-Type", "text/event-stream")
+	h.Set("Cache-Control", "no-cache")
+	h.Set("X-Accel-Buffering", "no")
+
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		s.logger.Warn("response writer does not support flushing")
+		return
+	}
+	w.WriteHeader(http.StatusOK)
+
+	scanner := bufio.NewScanner(r)
+	scanner.Buffer(make([]byte, 64*1024), maxStreamLine)
+	for scanner.Scan() {
+		if ctx.Err() != nil {
+			return
+		}
+		clean, drop := convert.SanitizeChunk(scanner.Bytes())
+		if drop {
+			continue
+		}
+		if _, err := w.Write(convert.EncodeSSE(clean)); err != nil {
+			s.logger.Debug("stream write failed", "err", err)
+			return
+		}
+		flusher.Flush()
+	}
+	if err := scanner.Err(); err != nil {
+		if ctx.Err() == nil {
+			s.logger.Warn("upstream stream error", "err", err)
+			w.Write(convert.ErrorChunk("upstream_stream_error", ""))
+			w.Write(convert.DONE)
+			flusher.Flush()
+		}
+		return
+	}
+	w.Write(convert.DONE)
+	flusher.Flush()
+}
+
+// relayJSON drains the upstream SSE stream through the accumulator and
+// writes one chat.completion JSON response. On any decode or stream error
+// nothing is written and a 502 is returned (the client asked for a single
+// response; a partial one would be worse than none).
+func (s *Server) relayJSON(ctx context.Context, w http.ResponseWriter, r io.Reader) {
+	acc := convert.NewAccumulator()
+	scanner := bufio.NewScanner(r)
+	scanner.Buffer(make([]byte, 64*1024), maxStreamLine)
+	for scanner.Scan() {
+		if ctx.Err() != nil {
+			return
+		}
+		if err := acc.Add(scanner.Bytes()); err != nil {
+			s.writeJSONError(w, http.StatusBadGateway,
+				"failed to decode upstream stream: "+err.Error(), "upstream_error", "upstream_unavailable", 0)
+			return
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		if ctx.Err() == nil {
+			s.writeJSONError(w, http.StatusBadGateway,
+				"upstream stream error: "+err.Error(), "upstream_error", "upstream_unavailable", 0)
+		}
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	w.Write(acc.Finish())
+}
+
+// --- models / healthz ---
+
+// handleModels serves the OpenAI model-list shape with the registry's
+// current models; created is pinned to server start so every entry matches.
+func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
+	created := s.started.Unix()
+	models := s.reg.Models()
+	data := make([]map[string]any, 0, len(models))
+	for _, id := range models {
+		data = append(data, map[string]any{
+			"id":       id,
+			"object":   "model",
+			"created":  created,
+			"owned_by": "freebuff",
+		})
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]any{"object": "list", "data": data})
+}
+
+// handleHealthz reports uptime, model count, and the per-token snapshot.
+func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"uptime_seconds": int64(time.Since(s.started).Seconds()),
+		"models":         s.reg.ModelCount(),
+		"tokens":         s.pool.Snapshot(),
+	})
+}
+
+// --- error mapping ---
+
+// openAIError is the OpenAI error body; an empty code is omitted.
+type openAIError struct {
+	Message string `json:"message"`
+	Type    string `json:"type"`
+	Code    string `json:"code,omitempty"`
+}
+
+// writeJSONError writes an OpenAI-shaped error response. Retry-After is set
+// (in ceil seconds) only when retryAfter > 0.
+func (s *Server) writeJSONError(w http.ResponseWriter, status int, message, typ, code string, retryAfter time.Duration) {
+	h := w.Header()
+	h.Set("Content-Type", "application/json")
+	if retryAfter > 0 {
+		h.Set("Retry-After", strconv.Itoa(int(math.Ceil(retryAfter.Seconds()))))
+	}
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"error": openAIError{Message: message, Type: typ, Code: code},
+	})
+}
+
+// writeError maps any error from the pool/upstream to the PRD §6 matrix.
+// Canceled client contexts are logged and dropped (no response written).
+func (s *Server) writeError(w http.ResponseWriter, r *http.Request, err error) {
+	if errors.Is(err, context.Canceled) {
+		s.logger.Debug("request canceled by client", "err", err)
+		return
+	}
+	if r != nil && r.Context().Err() != nil {
+		s.logger.Debug("client context canceled; not writing error", "err", err)
+		return
+	}
+
+	var wr *session.WaitingRoomError
+	if errors.As(err, &wr) {
+		s.writeJSONError(w, http.StatusServiceUnavailable,
+			wr.Error(), "server_error", "waiting_room_queued", wr.RetryAfter)
+		return
+	}
+	var uwr *upstream.WaitingRoomError
+	if errors.As(err, &uwr) {
+		s.writeJSONError(w, http.StatusServiceUnavailable,
+			uwr.Error(), "server_error", "waiting_room_queued", uwr.RetryAfter)
+		return
+	}
+	var ue *upstream.UpstreamError
+	if errors.As(err, &ue) {
+		status := ue.Status
+		if status != http.StatusPaymentRequired && status != http.StatusConflict && status != http.StatusTooManyRequests {
+			status = http.StatusBadGateway
+		}
+		msg := ue.Body
+		if msg == "" {
+			msg = "upstream error"
+		}
+		s.writeJSONError(w, status, msg, "upstream_error", "", ue.RetryAfter)
+		return
+	}
+
+	switch {
+	case errors.Is(err, registry.ErrModelNotFound):
+		s.writeJSONError(w, http.StatusBadRequest,
+			err.Error()+"; available: "+strings.Join(s.reg.Models(), ", "),
+			"invalid_request_error", "model_not_found", 0)
+	case errors.Is(err, upstream.ErrAuthRejected):
+		s.writeJSONError(w, http.StatusBadGateway,
+			err.Error(), "upstream_error", "upstream_auth_rejected", 0)
+	case errors.Is(err, upstream.ErrWaitingRoom):
+		s.writeJSONError(w, http.StatusServiceUnavailable,
+			err.Error(), "server_error", "waiting_room_queued", 0)
+	default:
+		// Combined pool exhaustion and any other unclassified failure.
+		s.writeJSONError(w, http.StatusBadGateway,
+			err.Error(), "upstream_error", "upstream_unavailable", 0)
+	}
+}

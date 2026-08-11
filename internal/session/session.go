@@ -109,15 +109,23 @@ func (m *Manager) EnsureSession(ctx context.Context) (string, error) {
 			}
 		}
 		singleFlight := m.refreshing
-		if !singleFlight {
+		// Capture the channel under the lock: the refresher clears
+		// m.refreshCh (sets it to nil) when it finishes, and an unlocked
+		// read here would race with that write — and could read nil, which
+		// would block the select forever.
+		var refreshCh chan struct{}
+		if singleFlight {
+			refreshCh = m.refreshCh
+		} else {
 			m.refreshing = true
-			m.refreshCh = make(chan struct{})
+			refreshCh = make(chan struct{})
+			m.refreshCh = refreshCh
 		}
 		m.mu.Unlock()
 
 		if singleFlight {
 			select {
-			case <-m.refreshCh:
+			case <-refreshCh:
 				continue // loop re-evaluates cached state
 			case <-ctx.Done():
 				return "", ctx.Err()

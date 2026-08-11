@@ -304,3 +304,21 @@ func (m *MockUpstream) BodyContains(substr string) bool {
 	}
 	return false
 }
+
+// StartedRunsSnapshot returns a locked copy of the started-run agent ids.
+// Use this instead of reading StartedRuns directly: the mock server goroutine
+// appends to the field while requests are in flight, so raw reads race under
+// -race whenever the test polls asynchronously (e.g. in eventually loops).
+func (m *MockUpstream) StartedRunsSnapshot() []string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return append([]string(nil), m.StartedRuns...)
+}
+
+// FinishedRunsSnapshot returns a locked copy of the finished runs. Use this
+// instead of reading FinishedRuns directly (see StartedRunsSnapshot).
+func (m *MockUpstream) FinishedRunsSnapshot() []FinishedRun {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return append([]FinishedRun(nil), m.FinishedRuns...)
+}

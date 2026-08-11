@@ -19,6 +19,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"strings"
 	"sync"
@@ -79,6 +80,7 @@ type Pool struct {
 type tokenEntry struct {
 	session *session.Manager
 	runs    *runs.RunManager
+	client  *upstream.Client
 }
 
 // New builds the pool over the configured tokens. len(clients) and
@@ -103,6 +105,7 @@ func New(cfg *config.Config, clients []*upstream.Client, sessions []*session.Man
 		p.toks = append(p.toks, &tokenEntry{
 			session: sessions[i],
 			runs:    runs.NewRunManager(clients[i], sessions[i], cfg.RotationInterval),
+			client:  clients[i],
 		})
 	}
 	return p, nil
@@ -172,6 +175,46 @@ func (p *Pool) LeaseRelease(lease *Lease) {
 		return
 	}
 	p.toks[lease.Token].runs.Release(lease.Run)
+}
+
+// InvalidateSession drops the cached free session of token so the next
+// Acquire re-creates it (session-invalid recovery). Out-of-range tokens are
+// ignored.
+func (p *Pool) InvalidateSession(token int) {
+	if token < 0 || token >= len(p.toks) {
+		return
+	}
+	p.toks[token].session.Invalidate()
+}
+
+// InvalidateRun drops the current run of token for agentID so the next
+// Acquire starts a fresh one (run-invalid recovery). Out-of-range tokens are
+// ignored.
+func (p *Pool) InvalidateRun(token int, agentID string) {
+	if token < 0 || token >= len(p.toks) {
+		return
+	}
+	p.toks[token].runs.Invalidate(agentID)
+}
+
+// CooldownToken puts token in a cooldown window of duration d (auth-reject
+// recovery, e.g. runs.DefaultCooldown). Out-of-range tokens are ignored.
+func (p *Pool) CooldownToken(token int, d time.Duration) {
+	if token < 0 || token >= len(p.toks) {
+		return
+	}
+	p.toks[token].runs.Cooldown(d)
+}
+
+// Chat sends a chat-completion request through the leased token's upstream
+// client, returning the raw SSE body reader on 2xx. The caller must release
+// the lease (LeaseRelease) once the request completes or fails, and close
+// the returned body.
+func (p *Pool) Chat(ctx context.Context, lease *Lease, opts upstream.ChatOptions, body []byte) (io.ReadCloser, error) {
+	if lease == nil || lease.Token < 0 || lease.Token >= len(p.toks) {
+		return nil, errors.New("pool: chat: invalid lease token")
+	}
+	return p.toks[lease.Token].client.ChatCompletions(ctx, opts, body)
 }
 
 // Start launches the background jobs: a best-effort prewarm of every
