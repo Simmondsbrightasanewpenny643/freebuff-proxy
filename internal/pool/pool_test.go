@@ -1,0 +1,440 @@
+package pool
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"freebuff-proxy/internal/config"
+	"freebuff-proxy/internal/registry"
+	"freebuff-proxy/internal/session"
+	"freebuff-proxy/internal/testutil"
+	"freebuff-proxy/internal/upstream"
+)
+
+// Test models must map to agents with EXCLUSIVE ownership in the registry
+// FALLBACK map (see internal/registry/registry_test.go expectedFallback):
+// the five base2-free models are first-seen-assigned to the generic
+// base2-free agent, while glm-5.2 and laguna-s-2.1 are owned by their
+// dedicated one-model agents. Tests pin the offline (fallback) state.
+const (
+	modelA = "z-ai/glm-5.2"
+	modelB = "poolside/laguna-s-2.1"
+	agentA = "base2-free-glm"
+	agentB = "base2-free-laguna-s-2-1"
+)
+
+// newTestPool wires one mock upstream per token through real clients and
+// session managers, backed by the registry fallback map.
+func newTestPool(t *testing.T, mocks ...*testutil.MockUpstream) *Pool {
+	t.Helper()
+	cfg := &config.Config{
+		AuthTokens:         make([]string, len(mocks)),
+		RotationInterval:   time.Hour,
+		RequestTimeout:     15 * time.Minute,
+		SessionCallTimeout: 5 * time.Second,
+		RegistryRefresh:    6 * time.Hour,
+		UpstreamBaseURL:    "https://www.codebuff.com",
+	}
+	clients := make([]*upstream.Client, 0, len(mocks))
+	sessions := make([]*session.Manager, 0, len(mocks))
+	for i, mock := range mocks {
+		cfg.AuthTokens[i] = fmt.Sprintf("tok-%d", i)
+		clientCfg := *cfg
+		clientCfg.UpstreamBaseURL = mock.URL()
+		client, err := upstream.New(cfg.AuthTokens[i], &clientCfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		clients = append(clients, client)
+		sessions = append(sessions, session.NewManager(client))
+	}
+	reg := registry.New(cfg, nil)
+	reg.LoadFallback()
+	p, err := New(cfg, clients, sessions, reg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return p
+}
+
+func TestNewLengthMismatch(t *testing.T) {
+	cfg := &config.Config{AuthTokens: []string{"a", "b"}, RotationInterval: time.Hour}
+	if _, err := New(cfg, nil, nil, registry.New(cfg, nil)); err == nil {
+		t.Fatal("want error for client/session count mismatch")
+	}
+}
+
+func TestRoundRobinDistribution(t *testing.T) {
+	mock0 := testutil.NewMock()
+	defer mock0.Close()
+	mock1 := testutil.NewMock()
+	defer mock1.Close()
+	p := newTestPool(t, mock0, mock1)
+
+	const n = 6
+	got := make([]int, n)
+	for i := 0; i < n; i++ {
+		lease, err := p.Acquire(context.Background(), modelA)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got[i] = lease.Token
+		if lease.AgentID != agentA {
+			t.Errorf("lease agent = %q, want %q", lease.AgentID, agentA)
+		}
+		p.LeaseRelease(lease)
+	}
+	for i, want := range []int{0, 1, 0, 1, 0, 1} {
+		if got[i] != want {
+			t.Errorf("acquire %d token = %d, want %d", i, got[i], want)
+		}
+	}
+	// Both tokens created the run for the agent exactly once.
+	for i, mock := range []*testutil.MockUpstream{mock0, mock1} {
+		if len(mock.StartedRuns) != 1 || mock.StartedRuns[0] != agentA {
+			t.Errorf("mock%d started runs = %v, want [%s]", i, mock.StartedRuns, agentA)
+		}
+		if len(mock.FinishedRuns) != 0 {
+			t.Errorf("mock%d finished runs = %v, want none", i, mock.FinishedRuns)
+		}
+	}
+
+	snaps := p.Snapshot()
+	for i, snap := range snaps {
+		if snap.ActiveRuns != 1 || snap.Requests != 3 {
+			t.Errorf("token %d snapshot: active=%d requests=%d, want 1/3", i, snap.ActiveRuns, snap.Requests)
+		}
+		if snap.SessionStatus != "active" || snap.SessionInstanceID != "inst-abc-123" {
+			t.Errorf("token %d session snapshot = %q/%q", i, snap.SessionStatus, snap.SessionInstanceID)
+		}
+	}
+}
+
+func TestFailoverOnAuthReject(t *testing.T) {
+	bad := testutil.NewMock() // token-1: 401 on every route
+	defer bad.Close()
+	bad.AuthReject = true
+	good := testutil.NewMock() // token-2: healthy
+	defer good.Close()
+	p := newTestPool(t, bad, good)
+
+	lease, err := p.Acquire(context.Background(), modelA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if lease.Token != 1 {
+		t.Errorf("lease token = %d, want 1 (failover to healthy)", lease.Token)
+	}
+	if lease.SessionInstanceID != "inst-abc-123" {
+		t.Errorf("session instance = %q, want inst-abc-123", lease.SessionInstanceID)
+	}
+	p.LeaseRelease(lease)
+
+	if len(bad.StartedRuns) != 0 {
+		t.Errorf("rejecting token started runs: %v", bad.StartedRuns)
+	}
+	if len(good.StartedRuns) != 1 {
+		t.Errorf("healthy token started runs = %v, want 1", good.StartedRuns)
+	}
+
+	// The dead token must be on a 30-min cooldown; subsequent acquires skip
+	// it entirely (round-robin returns to it on the 3rd acquire).
+	snap := p.Snapshot()[0]
+	if snap.CooldownUntil.Before(time.Now().Add(29 * time.Minute)) {
+		t.Errorf("cooldown until = %v, want ~now+30m", snap.CooldownUntil)
+	}
+	for i := 0; i < 2; i++ {
+		lease, err := p.Acquire(context.Background(), modelA)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if lease.Token != 1 {
+			t.Errorf("acquire %d token = %d, want 1 (dead token skipped)", i, lease.Token)
+		}
+		p.LeaseRelease(lease)
+	}
+	if len(good.StartedRuns) != 1 {
+		t.Errorf("healthy token re-STARTed: %v", good.StartedRuns)
+	}
+}
+
+func TestWaitingRoomBestPosition(t *testing.T) {
+	mock0 := testutil.NewMock()
+	defer mock0.Close()
+	mock0.SessionMode = "queued"
+	mock0.QueuePosition = 3
+	mock0.QueueDepth = 7
+	mock0.EstimatedWaitMs = 5000
+	mock1 := testutil.NewMock()
+	defer mock1.Close()
+	mock1.SessionMode = "queued"
+	mock1.QueuePosition = 1
+	mock1.QueueDepth = 9
+	mock1.EstimatedWaitMs = 5000
+	p := newTestPool(t, mock0, mock1)
+
+	_, err := p.Acquire(context.Background(), modelA)
+	var wr *session.WaitingRoomError
+	if !errors.As(err, &wr) {
+		t.Fatalf("want session.WaitingRoomError, got %v", err)
+	}
+	if wr.Position != 1 || wr.QueueDepth != 9 {
+		t.Errorf("waiting room = position %d depth %d, want 1/9 (best position)", wr.Position, wr.QueueDepth)
+	}
+	if wr.RetryAfter < 4*time.Second {
+		t.Errorf("RetryAfter = %s, want ~5s", wr.RetryAfter)
+	}
+}
+
+func TestWaitingRoomTieBreaksByQueueDepth(t *testing.T) {
+	mock0 := testutil.NewMock()
+	defer mock0.Close()
+	mock0.SessionMode = "queued"
+	mock0.QueuePosition = 3
+	mock0.QueueDepth = 7
+	mock0.EstimatedWaitMs = 5000
+	mock1 := testutil.NewMock()
+	defer mock1.Close()
+	mock1.SessionMode = "queued"
+	mock1.QueuePosition = 3
+	mock1.QueueDepth = 4
+	mock1.EstimatedWaitMs = 5000
+	p := newTestPool(t, mock0, mock1)
+
+	_, err := p.Acquire(context.Background(), modelA)
+	var wr *session.WaitingRoomError
+	if !errors.As(err, &wr) {
+		t.Fatalf("want session.WaitingRoomError, got %v", err)
+	}
+	if wr.Position != 3 || wr.QueueDepth != 4 {
+		t.Errorf("waiting room = position %d depth %d, want 3/4 (lowest depth on tie)", wr.Position, wr.QueueDepth)
+	}
+}
+
+func TestAllFailedCombinedError(t *testing.T) {
+	mock0 := testutil.NewMock()
+	defer mock0.Close()
+	mock0.AuthReject = true
+	mock1 := testutil.NewMock()
+	defer mock1.Close()
+	mock1.AuthReject = true
+	p := newTestPool(t, mock0, mock1)
+
+	_, err := p.Acquire(context.Background(), modelA)
+	if err == nil {
+		t.Fatal("want combined error")
+	}
+	if !strings.Contains(err.Error(), "unable to acquire run from any token") {
+		t.Errorf("error = %q, want combined-error prefix", err)
+	}
+	for _, tok := range []string{"token-1", "token-2"} {
+		if !strings.Contains(err.Error(), tok) {
+			t.Errorf("combined error missing %s: %q", tok, err)
+		}
+	}
+	for _, snap := range p.Snapshot() {
+		if snap.CooldownUntil.Before(time.Now().Add(29 * time.Minute)) {
+			t.Errorf("token %d not cooled down: %v", snap.Token, snap.CooldownUntil)
+		}
+	}
+}
+
+func TestWaitingRoomOnlyWhenEveryTokenQueued(t *testing.T) {
+	mock0 := testutil.NewMock()
+	defer mock0.Close()
+	mock0.SessionMode = "queued"
+	mock0.QueuePosition = 2
+	mock0.QueueDepth = 5
+	mock0.EstimatedWaitMs = 5000
+	mock1 := testutil.NewMock()
+	defer mock1.Close()
+	mock1.AuthReject = true
+	p := newTestPool(t, mock0, mock1)
+
+	_, err := p.Acquire(context.Background(), modelA)
+	if err == nil {
+		t.Fatal("want error")
+	}
+	var wr *session.WaitingRoomError
+	if errors.As(err, &wr) {
+		t.Fatalf("waiting-room error surfaced although only one token is queued: %v", err)
+	}
+	if !strings.Contains(err.Error(), "unable to acquire run from any token") {
+		t.Errorf("error = %q, want combined error", err)
+	}
+}
+
+func TestSessionInstanceIDOnLease(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	p := newTestPool(t, mock)
+
+	lease, err := p.Acquire(context.Background(), modelA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if lease.SessionInstanceID != "inst-abc-123" {
+		t.Errorf("instance = %q, want inst-abc-123", lease.SessionInstanceID)
+	}
+	p.LeaseRelease(lease)
+}
+
+func TestDisabledSessionLease(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	mock.SessionMode = "disabled"
+	p := newTestPool(t, mock)
+
+	lease, err := p.Acquire(context.Background(), modelA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if lease.SessionInstanceID != "" {
+		t.Errorf("instance = %q, want empty for disabled session", lease.SessionInstanceID)
+	}
+	p.LeaseRelease(lease)
+}
+
+func TestUnknownModel(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	p := newTestPool(t, mock)
+
+	_, err := p.Acquire(context.Background(), "no/such-model")
+	if !errors.Is(err, registry.ErrModelNotFound) {
+		t.Fatalf("want registry.ErrModelNotFound, got %v", err)
+	}
+}
+
+func TestStartPrewarmsAndShutdownDrains(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	ids := make([]string, 100)
+	for i := range ids {
+		ids[i] = fmt.Sprintf("run-%04d", i)
+	}
+	mock.RunIDs = ids
+	p := newTestPool(t, mock)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	p.Start(ctx)
+	defer cancel()
+
+	// Prewarm runs in the background: wait until every registry agent has a
+	// STARTed run.
+	agentCount := len(p.regAgentIDs(t))
+	eventually(t, "prewarm of all agents", func() bool {
+		return len(mock.StartedRuns) >= agentCount
+	})
+
+	p.Shutdown(context.Background())
+
+	eventually(t, "shutdown drain FINISHes", func() bool {
+		return len(mock.FinishedRuns) >= agentCount
+	})
+	for _, f := range mock.FinishedRuns {
+		if f.Status != "completed" {
+			t.Errorf("run %s finished with status %q, want completed", f.RunID, f.Status)
+		}
+	}
+}
+
+// regAgentIDs re-reads the pool's registry agent list through a fresh
+// fallback registry (the pool does not export its registry).
+func (p *Pool) regAgentIDs(t *testing.T) []string {
+	t.Helper()
+	reg := registry.New(p.cfg, nil)
+	reg.LoadFallback()
+	return reg.AgentIDs()
+}
+
+func TestConcurrentAcquireHammer(t *testing.T) {
+	mocks := []*testutil.MockUpstream{testutil.NewMock(), testutil.NewMock(), testutil.NewMock()}
+	defer func() {
+		for _, m := range mocks {
+			m.Close()
+		}
+	}()
+	for _, m := range mocks {
+		ids := make([]string, 100)
+		for i := range ids {
+			ids[i] = fmt.Sprintf("run-%04d", i)
+		}
+		m.RunIDs = ids
+	}
+	p := newTestPool(t, mocks...)
+
+	models := []string{modelA, modelB}
+	const goroutines = 8
+	const perGoroutine = 25
+	var wg sync.WaitGroup
+	var failures atomicErr
+	for g := 0; g < goroutines; g++ {
+		wg.Add(1)
+		go func(g int) {
+			defer wg.Done()
+			for i := 0; i < perGoroutine; i++ {
+				lease, err := p.Acquire(context.Background(), models[(g+i)%len(models)])
+				if err != nil {
+					failures.set(err)
+					continue
+				}
+				p.LeaseRelease(lease)
+			}
+		}(g)
+	}
+	wg.Wait()
+
+	if err := failures.get(); err != nil {
+		t.Fatalf("acquire failed: %v", err)
+	}
+	var totalRequests, activeRuns int
+	for _, snap := range p.Snapshot() {
+		totalRequests += snap.Requests
+		activeRuns += snap.ActiveRuns
+	}
+	if totalRequests != goroutines*perGoroutine {
+		t.Errorf("total requests = %d, want %d", totalRequests, goroutines*perGoroutine)
+	}
+	if activeRuns != len(mocks)*2 {
+		t.Errorf("active runs = %d, want %d (both agents on all tokens)", activeRuns, len(mocks)*2)
+	}
+}
+
+// eventually polls cond until it holds or the deadline passes.
+func eventually(t *testing.T, what string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("timeout waiting for %s", what)
+}
+
+// atomicErr is a thread-safe first-error holder for the hammer.
+type atomicErr struct {
+	mu  sync.Mutex
+	err error
+}
+
+func (e *atomicErr) set(err error) {
+	e.mu.Lock()
+	if e.err == nil {
+		e.err = err
+	}
+	e.mu.Unlock()
+}
+
+func (e *atomicErr) get() error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.err
+}

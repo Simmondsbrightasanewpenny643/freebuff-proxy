@@ -1,0 +1,12 @@
+
+# third-party reference clones (CodebuffAI/freebuff)
+reference/
+
+# local secrets / runtime artifacts
+.env
+dump/
+*.log
+config.json
+dist/
+
+

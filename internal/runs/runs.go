@@ -1,0 +1,359 @@
+// Package runs implements the per-agent FreeBuff agent-run lifecycle for a
+// single token: lazy START on first use, 6h rotation, FINISH drain, 30-min
+// auth cooldown, and a shutdown drain. Port of
+// reference/proxy-freebuff/lib/runs.js and freebuff2api-quorinex
+// run_manager.go (tokenPool half), adapted to this project's layout: the
+// session manager is owned by the caller (pool) and only used here for the
+// shutdown EndSession, and the pool — not this package — decides which token
+// serves a request.
+//
+// Concurrency: all run bookkeeping is guarded by the manager mutex; no lock
+// is held across upstream calls. Rotation swaps the current run under the
+// lock and hands the old one to an async finishIfReady, so concurrent
+// acquires are race-safe.
+package runs
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"log/slog"
+	"strings"
+	"sync"
+	"time"
+
+	"freebuff-proxy/internal/session"
+	"freebuff-proxy/internal/upstream"
+)
+
+// DefaultCooldown is the token cooldown applied on upstream auth rejection
+// (PRD §5.3: "401 triggers 30-min token cooldown").
+const DefaultCooldown = 30 * time.Minute
+
+// shutdownTimeout bounds Shutdown when the caller passes a context without a
+// deadline (PRD §5: "10s force deadline").
+const shutdownTimeout = 10 * time.Second
+
+// Run is one agent run leased to a caller. Requests counts acquires served
+// by this run; it is sent as totalSteps when the run is FINISHed.
+type Run struct {
+	AgentID   string
+	RunID     string
+	StartedAt time.Time
+	Requests  int
+
+	inflight  int  // leases outstanding; guarded by the manager mutex
+	finishing bool // FINISH in flight; guarded by the manager mutex
+}
+
+// RunSnapshot is a best-effort view of the manager state for healthz.
+type RunSnapshot struct {
+	ActiveRuns    int
+	CooldownUntil time.Time
+	Requests      int
+}
+
+// RunManager owns the current runs (one per agent) plus the draining list
+// for a single token.
+type RunManager struct {
+	client           *upstream.Client
+	session          *session.Manager
+	rotationInterval time.Duration
+
+	mu            sync.Mutex
+	runs          map[string]*Run // agentID → current run
+	draining      []*Run          // rotated runs awaiting FINISH
+	cooldownUntil time.Time
+	// totalRequests is the cumulative count of Acquire leases handed out.
+	// It is kept separate from the per-run counters because rotated runs
+	// that get FINISHed leave the active+draining sets and would otherwise
+	// take their request counts out of Snapshot.
+	totalRequests int
+}
+
+// NewRunManager builds the manager for one token. rotationInterval is how
+// long a run lives before it is rotated (config ROTATION_INTERVAL, default
+// 6h). The session manager is used only for Shutdown's EndSession.
+func NewRunManager(client *upstream.Client, session *session.Manager, rotationInterval time.Duration) *RunManager {
+	return &RunManager{
+		client:           client,
+		session:          session,
+		rotationInterval: rotationInterval,
+		runs:             make(map[string]*Run),
+	}
+}
+
+// Acquire returns the current run for agentID, starting one on first use or
+// rotating when the current run has reached the rotation interval. The
+// rotated run is pushed to the draining list and FINISHed asynchronously.
+// The returned run has its inflight and Requests counters incremented;
+// callers must Release it when the request completes or fails.
+func (m *RunManager) Acquire(ctx context.Context, agentID string) (*Run, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
+	m.mu.Lock()
+	if now := time.Now(); now.Before(m.cooldownUntil) {
+		until := m.cooldownUntil
+		m.mu.Unlock()
+		return nil, fmt.Errorf("token cooling down until %s", until.Format(time.RFC3339))
+	}
+	run := m.runs[agentID]
+	needsRotate := run == nil || time.Since(run.StartedAt) >= m.rotationInterval
+	m.mu.Unlock()
+
+	if needsRotate {
+		if err := m.rotate(ctx, agentID); err != nil {
+			return nil, err
+		}
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	// A concurrent acquire may have rotated again while we were starting;
+	// the lease must always point at the current run.
+	run = m.runs[agentID]
+	if run == nil {
+		return nil, errors.New("run missing after rotation")
+	}
+	run.inflight++
+	run.Requests++
+	m.totalRequests++
+	return run, nil
+}
+
+// Release decrements the inflight counter of a leased run. Safe on nil.
+// Draining finishes happen on the maintain tick or the next rotation.
+func (m *RunManager) Release(run *Run) {
+	if run == nil {
+		return
+	}
+	m.mu.Lock()
+	if run.inflight > 0 {
+		run.inflight--
+	}
+	m.mu.Unlock()
+}
+
+// FinishRun FINISHes the run upstream with the given step accounting and
+// drops it from the active set. On upstream failure the run is put back on
+// the draining list so Maintain retries it. It does not touch inflight —
+// callers should have already Released the lease.
+func (m *RunManager) FinishRun(ctx context.Context, run *Run, totalSteps int) {
+	if run == nil {
+		return
+	}
+	m.drop(run)
+	if err := m.client.FinishRun(ctx, run.RunID, totalSteps); err != nil {
+		// Keep the run around for a Maintain retry; the id is not
+		// necessarily dead upstream (network errors, 5xx).
+		m.mu.Lock()
+		m.draining = append(m.draining, run)
+		m.mu.Unlock()
+		slog.Debug("runs: FINISH failed, will retry on maintain", "run_id", run.RunID, "err", err)
+	}
+}
+
+// Maintain rotates aged runs and FINISHes the draining list. Runs with
+// outstanding inflight leases or an in-flight FINISH are skipped. Best
+// effort: failures are logged, never returned (background job).
+func (m *RunManager) Maintain(ctx context.Context) {
+	m.mu.Lock()
+	var toRotate []string
+	for agentID, run := range m.runs {
+		if time.Since(run.StartedAt) >= m.rotationInterval {
+			toRotate = append(toRotate, agentID)
+		}
+	}
+	draining := append([]*Run(nil), m.draining...)
+	m.mu.Unlock()
+
+	for _, agentID := range toRotate {
+		if err := m.rotate(ctx, agentID); err != nil {
+			slog.Debug("runs: maintain rotate failed", "agent_id", agentID, "err", err)
+		}
+	}
+	for _, run := range draining {
+		m.finishIfReady(run)
+	}
+}
+
+// Shutdown FINISHes every run (active and draining) and ends the upstream
+// session. When ctx carries no deadline a 10s force deadline is applied
+// (PRD §5.5 shutdown sequence).
+func (m *RunManager) Shutdown(ctx context.Context) {
+	if _, ok := ctx.Deadline(); !ok {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, shutdownTimeout)
+		defer cancel()
+	}
+
+	m.mu.Lock()
+	all := make([]*Run, 0, len(m.runs)+len(m.draining))
+	for _, run := range m.runs {
+		all = append(all, run)
+	}
+	all = append(all, m.draining...)
+	m.runs = make(map[string]*Run)
+	m.draining = nil
+	m.mu.Unlock()
+
+	var errs []string
+	for _, run := range all {
+		if err := m.client.FinishRun(ctx, run.RunID, run.Requests); err != nil {
+			errs = append(errs, fmt.Sprintf("finish run %s: %v", run.RunID, err))
+		}
+	}
+	if err := m.session.EndSession(ctx); err != nil {
+		errs = append(errs, fmt.Sprintf("end session: %v", err))
+	}
+	if len(errs) > 0 {
+		slog.Warn("runs: shutdown with errors", "errors", strings.Join(errs, "; "))
+	}
+}
+
+// Invalidate drops the current run for agentID so the next Acquire starts a
+// fresh one. Used when an upstream chat reports the run id as unknown
+// (ErrRunInvalid); the dead run is not FINISHed (upstream already forgot it)
+// and not drained.
+func (m *RunManager) Invalidate(agentID string) {
+	m.mu.Lock()
+	delete(m.runs, agentID)
+	m.mu.Unlock()
+}
+
+// Cooldown puts the token in a cooldown window of duration d (e.g.
+// DefaultCooldown after an auth rejection). Durations <= 0 are ignored.
+func (m *RunManager) Cooldown(d time.Duration) {
+	if d <= 0 {
+		return
+	}
+	m.mu.Lock()
+	m.cooldownUntil = time.Now().Add(d)
+	m.mu.Unlock()
+}
+
+// CooldownUntil returns the cooldown deadline (zero when not cooling down).
+func (m *RunManager) CooldownUntil() time.Time {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.cooldownUntil
+}
+
+// Snapshot returns a best-effort view of the manager state.
+func (m *RunManager) Snapshot() RunSnapshot {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	s := RunSnapshot{ActiveRuns: len(m.runs), CooldownUntil: m.cooldownUntil, Requests: m.totalRequests}
+	return s
+}
+
+// Prewarm starts a run for every agent that does not already have a fresh
+// one, best-effort (per-agent errors are logged, never returned). Used at
+// pool boot so the first request does not pay the START latency.
+func (m *RunManager) Prewarm(ctx context.Context, agentIDs []string) {
+	for _, agentID := range agentIDs {
+		m.mu.Lock()
+		needs := m.runs[agentID] == nil
+		m.mu.Unlock()
+		if !needs {
+			continue
+		}
+		if err := m.rotate(ctx, agentID); err != nil {
+			slog.Debug("runs: prewarm failed", "agent_id", agentID, "err", err)
+		}
+	}
+}
+
+// --- internals ---
+
+// rotate starts a fresh run for agentID, pushing the previous current run
+// (if any) onto the draining list and finishing it asynchronously. The
+// double checks under the lock make concurrent rotators converge on one
+// START when possible.
+func (m *RunManager) rotate(ctx context.Context, agentID string) error {
+	m.mu.Lock()
+	if now := time.Now(); now.Before(m.cooldownUntil) {
+		until := m.cooldownUntil
+		m.mu.Unlock()
+		return fmt.Errorf("token cooling down until %s", until.Format(time.RFC3339))
+	}
+	if run := m.runs[agentID]; run != nil && time.Since(run.StartedAt) < m.rotationInterval {
+		m.mu.Unlock()
+		return nil // a concurrent rotator already refreshed it
+	}
+	m.mu.Unlock()
+
+	runID, err := m.client.StartRun(ctx, agentID)
+	if err != nil {
+		return err
+	}
+
+	m.mu.Lock()
+	oldRun := m.runs[agentID]
+	m.runs[agentID] = &Run{AgentID: agentID, RunID: runID, StartedAt: time.Now()}
+	if oldRun != nil {
+		m.draining = append(m.draining, oldRun)
+	}
+	m.mu.Unlock()
+
+	if oldRun != nil {
+		go m.finishIfReady(oldRun)
+	}
+	return nil
+}
+
+// finishIfReady FINISHes a rotated run once it has no outstanding leases and
+// is no longer the current run for its agent. Concurrent callers are
+// serialized by the finishing flag.
+func (m *RunManager) finishIfReady(run *Run) {
+	m.mu.Lock()
+	if run == nil || run.inflight > 0 || run.finishing {
+		m.mu.Unlock()
+		return
+	}
+	if current, ok := m.runs[run.AgentID]; ok && current == run {
+		m.mu.Unlock()
+		return
+	}
+	run.finishing = true
+	m.mu.Unlock()
+
+	// Client-side call timeout bounds this (sessionCallTimeout); background
+	// context is fine for a drain goroutine.
+	if err := m.client.FinishRun(context.Background(), run.RunID, run.Requests); err != nil {
+		m.mu.Lock()
+		run.finishing = false
+		m.mu.Unlock()
+		slog.Debug("runs: finish draining run failed", "run_id", run.RunID, "err", err)
+		return
+	}
+
+	m.mu.Lock()
+	filtered := m.draining[:0]
+	for _, d := range m.draining {
+		if d != run {
+			filtered = append(filtered, d)
+		}
+	}
+	m.draining = filtered
+	m.mu.Unlock()
+}
+
+// drop removes run from the active set (if it is still current) and the
+// draining list.
+func (m *RunManager) drop(run *Run) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if current, ok := m.runs[run.AgentID]; ok && current == run {
+		delete(m.runs, run.AgentID)
+	}
+	filtered := m.draining[:0]
+	for _, d := range m.draining {
+		if d != run {
+			filtered = append(filtered, d)
+		}
+	}
+	m.draining = filtered
+}

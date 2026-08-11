@@ -1,0 +1,272 @@
+// Package config loads and validates freebuff-proxy configuration.
+//
+// Precedence: JSON config file (optional) < environment variables. Every key
+// in the JSON file mirrors its environment variable name; values set in the
+// environment always win. Auth tokens and API keys are comma-separated lists
+// in the environment and JSON arrays in the file.
+package config
+
+import (
+	"encoding/json"
+	"errors"
+	"fmt"
+	"net/url"
+	"os"
+	"path/filepath"
+	"strings"
+	"time"
+)
+
+// Config is the fully-resolved, validated runtime configuration.
+type Config struct {
+	ListenAddr         string
+	UpstreamBaseURL    string
+	AuthTokens         []string
+	RotationInterval   time.Duration
+	RequestTimeout     time.Duration
+	SessionCallTimeout time.Duration
+	APIKeys            []string
+	HTTPProxy          string
+	SOCKS5Proxy        string
+	CostMode           string // "" (omit) or "free"; A/B pending, PRD §8
+	RegistryRefresh    time.Duration
+	DebugDump          bool
+	LogFile            string
+}
+
+// rawConfig mirrors the JSON file / env keys as strings so that parsing and
+// validation happen once, after all overrides are applied.
+type rawConfig struct {
+	ListenAddr         string   `json:"LISTEN_ADDR"`
+	UpstreamBaseURL    string   `json:"UPSTREAM_BASE_URL"`
+	AuthTokens         []string `json:"AUTH_TOKENS"`
+	RotationInterval   string   `json:"ROTATION_INTERVAL"`
+	RequestTimeout     string   `json:"REQUEST_TIMEOUT"`
+	SessionCallTimeout string   `json:"SESSION_CALL_TIMEOUT"`
+	APIKeys            []string `json:"API_KEYS"`
+	HTTPProxy          string   `json:"HTTP_PROXY"`
+	SOCKS5Proxy        string   `json:"SOCKS5_PROXY"`
+	CostMode           string   `json:"COST_MODE"`
+	RegistryRefresh    string   `json:"REGISTRY_REFRESH"`
+	DebugDump          bool     `json:"DEBUG_DUMP"`
+	LogFile            string   `json:"LOG_FILE"`
+}
+
+func defaultRawConfig() rawConfig {
+	return rawConfig{
+		ListenAddr:         ":3457",
+		UpstreamBaseURL:    "https://codebuff.com", // normalized to www.
+		RotationInterval:   "6h",
+		RequestTimeout:     "15m",
+		SessionCallTimeout: "30s",
+		RegistryRefresh:    "6h",
+	}
+}
+
+// Load resolves configuration from the optional JSON file at configPath
+// ("" skips the file) plus environment overrides, then validates it.
+func Load(configPath string) (Config, error) {
+	raw, err := loadRaw(configPath)
+	if err != nil {
+		return Config{}, err
+	}
+
+	overrideString(&raw.ListenAddr, "LISTEN_ADDR")
+	overrideString(&raw.UpstreamBaseURL, "UPSTREAM_BASE_URL")
+	overrideCSV(&raw.AuthTokens, "AUTH_TOKENS")
+	overrideString(&raw.RotationInterval, "ROTATION_INTERVAL")
+	overrideString(&raw.RequestTimeout, "REQUEST_TIMEOUT")
+	overrideString(&raw.SessionCallTimeout, "SESSION_CALL_TIMEOUT")
+	overrideCSV(&raw.APIKeys, "API_KEYS")
+	overrideString(&raw.HTTPProxy, "HTTP_PROXY")
+	overrideString(&raw.SOCKS5Proxy, "SOCKS5_PROXY")
+	overrideString(&raw.CostMode, "COST_MODE")
+	overrideString(&raw.RegistryRefresh, "REGISTRY_REFRESH")
+	overrideBool(&raw.DebugDump, "DEBUG_DUMP")
+	overrideString(&raw.LogFile, "LOG_FILE")
+
+	parseDuration := func(raw, name string) (time.Duration, error) {
+		d, err := time.ParseDuration(strings.TrimSpace(raw))
+		if err != nil {
+			return 0, fmt.Errorf("parse %s: %w", name, err)
+		}
+		return d, nil
+	}
+
+	rotationInterval, err := parseDuration(raw.RotationInterval, "ROTATION_INTERVAL")
+	if err != nil {
+		return Config{}, err
+	}
+	requestTimeout, err := parseDuration(raw.RequestTimeout, "REQUEST_TIMEOUT")
+	if err != nil {
+		return Config{}, err
+	}
+	sessionCallTimeout, err := parseDuration(raw.SessionCallTimeout, "SESSION_CALL_TIMEOUT")
+	if err != nil {
+		return Config{}, err
+	}
+	registryRefresh, err := parseDuration(raw.RegistryRefresh, "REGISTRY_REFRESH")
+	if err != nil {
+		return Config{}, err
+	}
+
+	upstreamBaseURL, err := normalizeUpstreamBaseURL(raw.UpstreamBaseURL)
+	if err != nil {
+		return Config{}, err
+	}
+
+	cfg := Config{
+		ListenAddr:         strings.TrimSpace(raw.ListenAddr),
+		UpstreamBaseURL:    upstreamBaseURL,
+		AuthTokens:         dedupeStrings(raw.AuthTokens),
+		RotationInterval:   rotationInterval,
+		RequestTimeout:     requestTimeout,
+		SessionCallTimeout: sessionCallTimeout,
+		APIKeys:            dedupeStrings(raw.APIKeys),
+		HTTPProxy:          strings.TrimSpace(raw.HTTPProxy),
+		SOCKS5Proxy:        strings.TrimSpace(raw.SOCKS5Proxy),
+		CostMode:           strings.TrimSpace(raw.CostMode),
+		RegistryRefresh:    registryRefresh,
+		DebugDump:          raw.DebugDump,
+		LogFile:            strings.TrimSpace(raw.LogFile),
+	}
+
+	if err := cfg.Validate(); err != nil {
+		return Config{}, err
+	}
+	return cfg, nil
+}
+
+// Validate checks the resolved configuration. It must be called before use.
+func (c Config) Validate() error {
+	switch {
+	case len(c.AuthTokens) == 0:
+		return errors.New("at least one AUTH_TOKENS is required")
+	case c.ListenAddr == "":
+		return errors.New("LISTEN_ADDR cannot be empty")
+	case c.UpstreamBaseURL == "":
+		return errors.New("UPSTREAM_BASE_URL cannot be empty")
+	case c.RotationInterval <= 0:
+		return errors.New("ROTATION_INTERVAL must be greater than zero")
+	case c.RequestTimeout <= 0:
+		return errors.New("REQUEST_TIMEOUT must be greater than zero")
+	case c.SessionCallTimeout <= 0:
+		return errors.New("SESSION_CALL_TIMEOUT must be greater than zero")
+	case c.RegistryRefresh <= 0:
+		return errors.New("REGISTRY_REFRESH must be greater than zero")
+	}
+
+	u, err := url.Parse(c.UpstreamBaseURL)
+	if err != nil {
+		return fmt.Errorf("UPSTREAM_BASE_URL %q is not a valid URL: %w", c.UpstreamBaseURL, err)
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return fmt.Errorf("UPSTREAM_BASE_URL %q must be an http(s) URL", c.UpstreamBaseURL)
+	}
+	if u.Host == "" {
+		return fmt.Errorf("UPSTREAM_BASE_URL %q has no host", c.UpstreamBaseURL)
+	}
+	return nil
+}
+
+// normalizeUpstreamBaseURL trims a trailing slash, requires an http(s) URL,
+// and rewrites the host codebuff.com to www.codebuff.com (the API only serves
+// the www host; the bare host redirects).
+func normalizeUpstreamBaseURL(raw string) (string, error) {
+	raw = strings.TrimSpace(strings.TrimRight(raw, "/"))
+	if raw == "" {
+		return "", errors.New("UPSTREAM_BASE_URL cannot be empty")
+	}
+
+	parsed, err := url.Parse(raw)
+	if err != nil {
+		return "", fmt.Errorf("UPSTREAM_BASE_URL %q is not a valid URL: %w", raw, err)
+	}
+	if parsed.Scheme != "http" && parsed.Scheme != "https" {
+		return "", fmt.Errorf("UPSTREAM_BASE_URL %q must be an http(s) URL", raw)
+	}
+	if parsed.Host == "" {
+		return "", fmt.Errorf("UPSTREAM_BASE_URL %q has no host", raw)
+	}
+
+	if strings.EqualFold(parsed.Host, "codebuff.com") {
+		parsed.Host = "www.codebuff.com"
+	}
+
+	return strings.TrimRight(parsed.String(), "/"), nil
+}
+
+func loadRaw(configPath string) (rawConfig, error) {
+	cfg := defaultRawConfig()
+
+	if configPath != "" {
+		path, err := filepath.Abs(configPath)
+		if err != nil {
+			return rawConfig{}, fmt.Errorf("resolve config path: %w", err)
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return rawConfig{}, fmt.Errorf("read config file: %w", err)
+		}
+		if err := json.Unmarshal(data, &cfg); err != nil {
+			return rawConfig{}, fmt.Errorf("parse config file: %w", err)
+		}
+	}
+
+	return cfg, nil
+}
+
+func overrideString(target *string, envName string) {
+	if value := strings.TrimSpace(os.Getenv(envName)); value != "" {
+		*target = value
+	}
+}
+
+func overrideCSV(target *[]string, envName string) {
+	if value := strings.TrimSpace(os.Getenv(envName)); value != "" {
+		*target = splitList(value)
+	}
+}
+
+// overrideBool sets target from DEBUG_DUMP-style env vars; unset or
+// unrecognized values leave the file/default value untouched.
+func overrideBool(target *bool, envName string) {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv(envName))) {
+	case "1", "true", "yes", "on":
+		*target = true
+	case "0", "false", "no", "off":
+		*target = false
+	}
+}
+
+func splitList(value string) []string {
+	fields := strings.FieldsFunc(value, func(r rune) bool {
+		return r == ',' || r == '\n' || r == '\r'
+	})
+	return compactStrings(fields)
+}
+
+func compactStrings(values []string) []string {
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			continue
+		}
+		out = append(out, value)
+	}
+	return out
+}
+
+func dedupeStrings(values []string) []string {
+	seen := make(map[string]struct{}, len(values))
+	out := make([]string, 0, len(values))
+	for _, value := range compactStrings(values) {
+		if _, exists := seen[value]; exists {
+			continue
+		}
+		seen[value] = struct{}{}
+		out = append(out, value)
+	}
+	return out
+}
