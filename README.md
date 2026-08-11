@@ -14,6 +14,43 @@ Docs: [PRD](docs/product/prd.md) · [Reference analysis](docs/research/freebuff-
 - **Multi-token pool** — `AUTH_TOKENS` (comma-separated) round-robin with linear failover; a token cools down for 30 minutes after a 401; when every token is queued, the token with the best waiting-room position is chosen.
 - **Live model registry** — the agent-to-model map is parsed from the `CodebuffAI/codebuff` TypeScript sources every `REGISTRY_REFRESH` (6h by default, hardcoded fallback at boot) and served via `/v1/models`.
 
+## Getting a token
+
+The proxy needs one or more FreeBuff **auth tokens** (`user_...` or UUID format) to talk to the upstream. There are two ways to obtain one (documented by the community proxies this project is based on):
+
+**Method 1 — Web (recommended, no install):** visit **[https://freebuff.llm.pm](https://freebuff.llm.pm)**, log in with your FreeBuff/Codebuff account, and the auth token is displayed directly on the page. Copy it. (Alternative: log in on the FreeBuff site, open DevTools → Application → Local Storage, and copy the auth token from there.)
+
+**Method 2 — Official CLI:** install and log in once — the CLI saves the token to a local credentials file:
+
+```bash
+npm i -g freebuff     # or the codebuff CLI, whichever you have
+freebuff              # first launch walks you through login
+```
+
+| OS | Credentials path |
+|---|---|
+| Windows | `C:\Users\<username>\.config\manicode\credentials.json` |
+| Linux / macOS | `~/.config/manicode/credentials.json` |
+
+The file looks like this — only the `authToken` value is needed:
+
+```json
+{
+  "default": {
+    "id": "user_10293847",
+    "name": "you",
+    "authToken": "fa82b5c1-e39d-4c7a-961f-d2b3c4e5f6a7",
+    "...": "..."
+  }
+}
+```
+
+**Rules:**
+- Copy the token **without** any `Bearer ` prefix — the proxy adds it upstream itself.
+- `.env` and `config.json` are gitignored: tokens never get committed.
+- For higher throughput, log in with multiple accounts and comma-separate all their tokens (`AUTH_TOKENS=tok1,tok2`) — the pool round-robins across them and fails over on 401 (30-min cooldown per token).
+- A token that persistently gets `401` upstream is expired/revoked — get a fresh one with the same steps.
+
 ## Quick start (binary)
 
 Requires Go 1.26+ (see `go.mod`) or a prebuilt release binary.
