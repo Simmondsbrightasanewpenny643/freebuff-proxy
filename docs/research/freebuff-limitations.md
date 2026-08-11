@@ -118,6 +118,71 @@ free-buff-lol, freebuff2api-optimized, freebuff2api-wokers, freebuff-proxy-hengx
   re-verifying during bursts. Future work; our shared per-token session is validated live
   (one instance served 9+ requests across 6 models).
 
+## 2e. The "3 projects per day" composer limit (2026-08-12) — SEPARATE from the API quota
+
+- The Freebuff **Web composer** (freebuff.com/web, formerly "Vly") and **Cloud** (freebuff.com/cloud)
+  are separate products from the CLI. The web app-builder shows *"your region is limited to
+  3 projects per day — 0/3"* for accounts in limited-tier regions (observed live, Indonesia).
+- This is a **project-creation quota for the app-builder only** — it does NOT gate the CLI
+  chat/session/agent-run endpoints our proxy uses, and it does NOT share the 6-session/day
+  budget. The CLI shows its own counter ("6.6 of 6 sessions used") while the web shows 0/3
+  projects — independent counters, same account.
+- Not documented publicly (no "3 projects" constant in CodebuffAI/codebuff; the app-builder
+  backend is not open-sourced). Closest official statement: Freebuff Cloud blog (2026-07-01)
+  — *"some regions are temporarily limited to one active project and one new project per day"*.
+  The "3" may be a newer value or a Web-composer-specific tier.
+- Tier detection for the composer is IP-based (Cloudflare/GeoIP) like the session tier, but the
+  project limit is enforced per-account after browser login. A SOCKS5 proxy may lift the *tier*
+  (more models), but the project-creation cap likely follows the account.
+- Referral/earn (freebuff.com/earn) unlocks extra CLI **sessions** (e.g. GLM 5.2), not composer
+  projects. ToS still says one account per person; no farming.
+- **Proxy impact: none.** Our proxy consumes only the CLI session quota. No code changes
+  needed; this is a third quota dimension users hit only when using the web/cloud products
+  directly.
+
+## 2f. Upstream intelligence from GitHub issues/PRs (2026-08-12, lib-3)
+
+- **Ban responses**: upstream returns `403 {"status":"banned"}` with a `resumes_at` timestamp
+  (Quorinex/Freebuff2API#8, XxxXTeam/freebuff2api#11). Heavy continuous usage (esp. V4 Flash
+  left running) triggers temporary bans; multiple accounts compound the risk. Bans are
+  temporary but have no documented duration beyond `resumes_at`. Our proxy does NOT detect
+  this yet — it falls through as a generic upstream error. **TODO: `ErrBanned` sentinel +
+  cooldown until `resumes_at`.**
+- **Country/tier gating**: `FREE_MODE_ALLOWED_COUNTRIES` is a hardcoded allowlist (US, CA, UK,
+  select EU) — Indonesia is NOT on it, which is why our account is `limited`. Detection is
+  Cloudflare `cf-ipcountry` + x-forwarded-for + ipinfo privacy signals. Blocked signals:
+  `anonymous`, `vpn`, `proxy`, `tor`, `relay`, `res_proxy` (403 `country_blocked` /
+  `anonymous_network`); `hosting`/`service` are NOT blocked post-commit b4367ac. A later
+  commit (0f331ed) made VPN traffic land in `limited` mode instead of hard block. The session
+  response carries `accessTier`, `countryCode`, `countryBlockReason`, `ipPrivacySignals` —
+  our `SessionState` ignores them. **TODO: parse + log for diagnostics.**
+- **Session statuses**: the type surface includes `banned`, `country_blocked`, `rate_limited`,
+  `model_locked`, `superseded` in addition to the ones we handle. `model_locked` = active
+  session bound to a different model. **TODO: handle these explicitly in the session machine.**
+- **Session fights**: two instances sharing one auth token fight over the session — the last
+  POST supersedes the previous (`status: "superseded"`); the loser gets session-invalid until
+  it re-creates (CodebuffAI/freebuff#897). Running the official CLI + our proxy on the same
+  token will thrash sessions. Constraint to document, not a bug.
+- **Waiting room is permanent**: PR #667 removes the waiting-room env-var toggle; the session
+  gate is always on, and the `disabled` status is becoming a 404-compat fallback. Our 503 +
+  Retry-After handling is the right shape.
+- **`developer` role**: upstream accepts only `system/user/assistant/tool/latest_reminder`;
+  `developer` → 400 (XxxXTeam/freebuff2api#3). Our `convert` normalizes `developer`→`system`
+  — confirmed correct.
+- **Quota transparency**: session responses carry `rateLimitsByModel` (`model`, `limit`,
+  `period` pacific_day|pacific_week, `resetAt`, `recentCount`) and `entitlementBreakdown`
+  (`base`, `referral`, `streak`, `promo`). GLM 5.2 has its own referral-gated pool; premium
+  and limited models have separate pools. **Idea: surface remaining quota in healthz.**
+- **Envelope injection is the critical anti-block measure** — without the CLI envelope
+  (`codebuff_metadata`, `x-freebuff-model`, `x-freebuff-instance-id`, `data_collection:deny`,
+  `stream:true`, `cb_easp`), upstream returns `403 free_mode_cli_required`. Confirmed our
+  implementation matches; if it ever drifts this error names it explicitly.
+- **No headless CLI**: freebuff CLI is TUI-only (no `-p`/`--print`/`--json`); the `authToken`
+  is a device-OAuth token (`~/.config/manicode/credentials.json`), and `@codebuff/sdk`
+  expects a paid `CODEBUFF_API_KEY` instead. Our token+HTTP approach is the only programmatic
+  path; `fingerprintId`/`fingerprintHash` exist in credentials but are not yet validated by
+  the chat API.
+
 ## 3. ToS constraints (freebuff.com/terms-of-service, 2026-07-23)
 
 - Free access is per **person**, one account per person; no multi-account farming.
