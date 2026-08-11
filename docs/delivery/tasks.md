@@ -49,7 +49,7 @@ Ordered risk-first; each slice is independently verifiable with `go test ./...` 
 - [x] Dockerfile (multi-stage: golang:1.26-alpine → alpine:3.20, static binary, non-root user) + docker-compose example (env_file, port publish, wget healthcheck on /healthz) + .dockerignore
 - [x] README.md: quick start (binary + Docker), config table, 9router provider snippet, mock-upstream testing, troubleshooting (incl. Kaspersky false positive), ToS disclaimer, CI badge
 - [x] CI via GitHub Actions (`.github/workflows/ci.yml`): build, vet, `go test -race ./...`, `go mod verify` on ubuntu-latest — **green**, and it caught 5 race-detector findings on its first run (see Slice 3 defects)
-- [ ] Docker build smoke (`docker compose up --build`) — no Docker on the dev machine; verify on any Docker host
+- [x] Docker build smoke — **verified on vps-01** (Ubuntu 24.04, Docker 29.7.2): `docker compose up --build` → container healthy, `/healthz` 200, `/v1/models` serving the live-parsed registry (27 agents / 12 models from Codebuff TS sources), full chat path exercised (dummy token → upstream 404 → clean 502 mapping). Image: 26MB (7.18MB uncompressed layers).
 
 ## Live verification (blocked on user)
 
