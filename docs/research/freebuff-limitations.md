@@ -183,6 +183,56 @@ free-buff-lol, freebuff2api-optimized, freebuff2api-wokers, freebuff-proxy-hengx
   path; `fingerprintId`/`fingerprintHash` exist in credentials but are not yet validated by
   the chat API.
 
+## 2g. Anti-block hardening techniques (2026-08-12, 16 newly cloned repos)
+
+Surveyed marktantongco/freebuff-proxy, freebuff-reverse, freebuff-bridge,
+freebuff2api-rs, freebuff2api-lza6, freebuff2cloudflare-api, codebuff-fork, and 9 more.
+Our proxy ALREADY has: CLI envelope injection, GET-before-POST session reuse, quota-safe
+maintenance, 429/ban/cooldown handling, Retry-After surfacing, waiting-room 503, tier
+diagnostics. Techniques we do NOT have (ranked by value/risk):
+
+1. **JA3/TLS fingerprint impersonation** (HIGH value, HIGH risk) — marktantongco uses
+   `github.com/refraction-networking/utls` (Chrome120/Safari17/Firefox120 profiles +
+   `HelloRandomized`), freebuff-reverse uses `github.com/bogdanfinn/tls-client` (100+
+   profiles, random TLS extension order, protocol racing). Plain Go `net/http` has a unique
+   ClientHello fingerprint. We currently pass the gate WITHOUT it — adds a dependency and
+   transport complexity; only worth it if upstream starts fingerprinting TLS.
+2. **Header sanitization + browser headers** (MEDIUM, LOW risk) — marktantongco strips 27
+   proxy-identifying headers (X-Forwarded-For, Via, CF-Connecting-IP, True-Client-IP) and
+   injects 11 browser-typical ones (Sec-CH-UA, Sec-Fetch-Site/Mode/Dest,
+   Upgrade-Insecure-Requests). We construct upstream requests fresh (nothing forwarded), so
+   stripping is moot; injecting Sec-* realism is a cheap optional add.
+3. **Session create gate** (LOW, LOW) — freebuff-reverse limits concurrent session creates
+   (global 128 / per-key 32 / per-model 32 / per-group 96) to prevent thundering herds. We
+   have single-flight refresh per token already; multi-token herds are bounded by token count.
+4. **Per-session concurrency semaphore** (LOW) — freebuff-reverse caps concurrent chats per
+   session with wait-or-reject backpressure. We already allow concurrent leases on one
+   session (validated live: 9+ requests on one instance).
+5. **Synthetic device fingerprint** (MEDIUM, UNKNOWN risk) — fatmuh generates
+   `enhanced-{sha256}` fingerprints with real device catalogs (MacBook M4, ThinkPad X1),
+   real OUI MACs, locally-administered bit, seeded per account. The CLI sends these; we
+   don't. Upstream doesn't currently reject us for their absence — adding unproven fields
+   could just as easily trigger the gate.
+6. **Desktop orchestrator protocol** (N/A) — freebuff-bridge reverse-engineered the Desktop
+   app's local REST+SSE API (thread messages, sessionSlots `{limit,used,holders}`,
+   quotaByModel, accessTier). Insight only: the desktop app itself shows session slot limits
+   and per-model quotas in its state.
+7. **Timing jitter** (LOW) — 50-300ms inter-request jitter + "reading time" simulation.
+   Adds latency for no measured benefit on a session-quota-gated service.
+8. **ResponseClass typed classification** (N/A) — freebuff-reverse classifies responses
+   Ok/RateLimited/AuthExpired/Retryable/Fatal at the transport layer. Equivalent to our
+   typed sentinels (RateLimitError/BanError/UpstreamError).
+
+**Official constants spotted** (codebuff-fork → wokers): `FREEBUFF_PREMIUM_SESSION_LIMIT=6`,
+`FREEBUFF_WEB_STANDARD_SESSION_LIMIT=6`, `FREEBUFF_DESKTOP_SESSION_LIMITS`
+(premium:1, unlimited:3 slots), `FREEBUFF_ROOT_AGENT_ID_BY_MODEL` (source of truth for the
+model→agent map our registry parses).
+
+**Verdict**: nothing in this batch is a must-have — our proxy already implements the
+quota-critical patterns, and the remaining techniques are either risky (TLS/fingerprint
+spoofing), low-value (gates/semaphores/jitter), or N/A (desktop protocol). Revisit JA3 if
+upstream ever starts rejecting our plain-Go ClientHello.
+
 ## 3. ToS constraints (freebuff.com/terms-of-service, 2026-07-23)
 
 - Free access is per **person**, one account per person; no multi-account farming.
