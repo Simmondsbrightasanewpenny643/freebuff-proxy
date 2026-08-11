@@ -233,6 +233,14 @@ quota-critical patterns, and the remaining techniques are either risky (TLS/fing
 spoofing), low-value (gates/semaphores/jitter), or N/A (desktop protocol). Revisit JA3 if
 upstream ever starts rejecting our plain-Go ClientHello.
 
+**UPDATE (2026-08-12)**: JA3/TLS impersonation + browser header injection implemented as an
+opt-in `TLS_FINGERPRINT` config (`chrome120`/`safari17`/`firefox120`/`random`, default plain
+Go transport). Ported from marktantongco's `internal/stealth` (utls dialer composing with our
+SOCKS5 path; profile-matched UA/Sec-CH-UA/Sec-Fetch-* headers; 27 proxy-identifying headers
+stripped). Deliberately excluded: timing jitter (latency, no benefit), synthetic device
+fingerprints (unproven fields), proxy pools (we have single SOCKS5). Enable only if upstream
+starts fingerprinting TLS.
+
 ## 3. ToS constraints (freebuff.com/terms-of-service, 2026-07-23)
 
 - Free access is per **person**, one account per person; no multi-account farming.
