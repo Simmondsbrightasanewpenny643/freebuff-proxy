@@ -85,16 +85,20 @@ Data lives in `~/.9router/` (SQLite). Default port: **20128** (dashboard `/dashb
 
 1. Open **http://localhost:20128/dashboard/providers**
 2. Under **Custom Providers (OpenAI/Anthropic Compatible)** click **Add OpenAI Compatible**
-3. Fill the form:
+3. Fill the form **exactly** (verified against the 9router source, `AddCompatibleModal.js`):
 
-   | Field | Value |
-   |---|---|
-   | Name | `freebuff` (any slug; becomes the model prefix) |
-   | Base URL | `http://127.0.0.1:3457/v1` (or `http://<proxy-host>:3457/v1`) |
-   | API Key | any non-empty value **when the proxy has no `API_KEYS` set** (auth is open on loopback). If you set `API_KEYS` in the proxy `.env`, use one of those values here |
-   | Models | the model IDs from `/v1/models` (see §4) |
+   | Field | Value | Why (from 9router source) |
+   |---|---|---|
+   | **Name** | `freebuff` | Required. Friendly label only. |
+   | **Prefix** | `freebuff` | Required. Becomes the model-id prefix: model combos are `freebuff/<model-id>` |
+   | **API Type** | **Chat Completions** | Keep the default `chat`. The proxy implements `/v1/chat/completions` only — **Responses API is NOT supported**; choosing it makes every request 404 |
+   | **Base URL** | `http://127.0.0.1:3457/v1` | (or `http://<proxy-host>:3457/v1`). Must end in `/v1` — 9router appends `/models`, `/chat/completions` to it |
+   | **API Key (for Check)** | any non-empty value (e.g. the FreeBuff token) | Used ONLY by the **Check** button. The **Create** button does not require it. With an empty proxy `API_KEYS`, any value passes |
+   | **Model ID (optional)** | **leave empty** | Only for providers *without* a `/models` endpoint (falls back to a chat-completions inference test). The proxy has `GET /v1/models` — the /models check succeeds and enumerates all 12 models |
+   | **Check** button | click it → expect a green **Valid** badge | 9router POSTs `/api/provider-nodes/validate` → `GET {base}/models` with your key, 10s timeout. Green = proxy reachable |
+   | **Create** button | click it | POSTs `/api/provider-nodes` `{name, prefix, apiType:"chat", baseUrl, type:"openai-compatible"}` |
 
-4. Save/connect. 9router will show the provider; model combo IDs become
+4. After create, open the node and add the models from `/v1/models` (see §4); each is addressed as
    `freebuff/<model-id>` (e.g. `freebuff/deepseek-v4-flash`).
 
 Equivalent raw config shape (for config-file or headless setups — 9router's custom provider
