@@ -37,12 +37,15 @@ codebuff.com (FreeBuff free tier — token-bound)
 
 | Where the proxy runs | Base URL in 9router |
 |---|---|
-| **Same machine as 9router** — binary **or** Docker Compose (default setup) | `http://127.0.0.1:3457/v1` |
+| **Same machine as 9router** — plain process (binary / systemd) **or** Docker Compose | `http://127.0.0.1:3457/v1` |
+| **9router itself runs in Docker** on the same host | `http://<docker-bridge-gateway>:3457/v1` — from inside a container the host is the bridge gateway (commonly `172.17.0.1`/`172.18.0.1`; find it: `docker network inspect <proxy-network> --format '{{(index .IPAM.Config 0).Gateway}}'`) |
 | **Another machine on your LAN** (e.g. a homelab box) | `http://<that-host-ip>:3457/v1` (e.g. `http://192.168.10.3:3457/v1`) |
 | **A VPS / remote server** | `http://<vps-ip-or-domain>:3457/v1` (firewall must allow 3457; if the container binds loopback, set `LISTEN_ADDR=:3457` in its env) |
 
 **When in doubt, use `http://127.0.0.1:3457/v1`** — it is correct whenever the proxy runs on
-the same machine as 9router, which is the default for both the binary and `docker compose up`.
+the same machine as 9router *as a plain process*. If 9router is containerized, use the
+gateway IP above (the `scripts/setup-proxy-docker.sh` installer detects and prints it for
+you).
 
 Example systemd unit (Ubuntu/Debian, same host as 9router):
 
@@ -104,7 +107,7 @@ Data lives in `~/.9router/` (SQLite). Default port: **20128** (dashboard `/dashb
    | **Name** | `freebuff` | Required. Friendly label only. |
    | **Prefix** | `freebuff` | Required. Becomes the model-id prefix: model combos are `freebuff/<model-id>` |
    | **API Type** | **Chat Completions** | Keep the default `chat`. The proxy implements `/v1/chat/completions` only — **Responses API is NOT supported**; choosing it makes every request 404 |
-   | **Base URL** | **default: `http://127.0.0.1:3457/v1`** (see the host table in §1; the port is always 3457) | Must end in `/v1` — 9router appends `/models`, `/chat/completions` to it. Correct for binary **and** Docker Compose on the same machine as 9router; use `http://<host-ip>:3457/v1` only when the proxy is on a different machine |
+   | **Base URL** | **default: `http://127.0.0.1:3457/v1`** — see the host table in §1; if 9router runs **in Docker**, use `http://<docker-gateway>:3457/v1` instead (detected automatically by `scripts/setup-proxy-docker.sh`) | Must end in `/v1` — 9router appends `/models`, `/chat/completions` to it |
    | **API Key (for Check)** | any non-empty value (e.g. the FreeBuff token) | Used ONLY by the **Check** button. The **Create** button does not require it. With an empty proxy `API_KEYS`, any value passes |
    | **Model ID (optional)** | **leave empty** | Only for providers *without* a `/models` endpoint (falls back to a chat-completions inference test). The proxy has `GET /v1/models` — the /models check succeeds and enumerates all 12 models |
    | **Check** button | click it → expect a green **Valid** badge | 9router POSTs `/api/provider-nodes/validate` → `GET {base}/models` with your key, 10s timeout. Green = proxy reachable |
