@@ -21,16 +21,28 @@ codebuff.com (FreeBuff free tier — token-bound)
 1. Get a token (see README → *Getting a token*: `freebuff.llm.pm` or
    `~/.config/manicode/credentials.json`).
 2. Run freebuff-proxy **with the token** (any of these):
-   - **Same machine as 9router (recommended):** build + run, or the systemd unit below →
-     `base_url = http://127.0.0.1:3457/v1`
-   - **Docker:** `docker compose up --build -d` (VPS example) → `base_url = http://<host>:3457/v1`;
-     open the firewall/NSG for port 3457 first
+   - **Same machine as 9router (recommended):** build + run, or the systemd unit below
+   - **Docker:** `docker compose up --build -d` (the compose file sets `LISTEN_ADDR=:3457`
+     and publishes port 3457 on the host)
+   - **Remote host / VPS:** run it there and open the firewall/NSG for port 3457
 3. Verify before touching 9router:
 
    ```bash
    curl http://127.0.0.1:3457/healthz     # {"models":12,"tokens":[...],"uptime_seconds":N}
    curl http://127.0.0.1:3457/v1/models   # the 12-model catalog
    ```
+
+**Base URL — which one to use in 9router:** the proxy listens on port **3457**; only the
+*host* part of the URL changes:
+
+| Where the proxy runs | Base URL in 9router |
+|---|---|
+| **Same machine as 9router** — binary **or** Docker Compose (default setup) | `http://127.0.0.1:3457/v1` |
+| **Another machine on your LAN** (e.g. a homelab box) | `http://<that-host-ip>:3457/v1` (e.g. `http://192.168.10.3:3457/v1`) |
+| **A VPS / remote server** | `http://<vps-ip-or-domain>:3457/v1` (firewall must allow 3457; if the container binds loopback, set `LISTEN_ADDR=:3457` in its env) |
+
+**When in doubt, use `http://127.0.0.1:3457/v1`** — it is correct whenever the proxy runs on
+the same machine as 9router, which is the default for both the binary and `docker compose up`.
 
 Example systemd unit (Ubuntu/Debian, same host as 9router):
 
@@ -92,7 +104,7 @@ Data lives in `~/.9router/` (SQLite). Default port: **20128** (dashboard `/dashb
    | **Name** | `freebuff` | Required. Friendly label only. |
    | **Prefix** | `freebuff` | Required. Becomes the model-id prefix: model combos are `freebuff/<model-id>` |
    | **API Type** | **Chat Completions** | Keep the default `chat`. The proxy implements `/v1/chat/completions` only — **Responses API is NOT supported**; choosing it makes every request 404 |
-   | **Base URL** | `http://127.0.0.1:3457/v1` | (or `http://<proxy-host>:3457/v1`). Must end in `/v1` — 9router appends `/models`, `/chat/completions` to it |
+   | **Base URL** | **default: `http://127.0.0.1:3457/v1`** (see the host table in §1; the port is always 3457) | Must end in `/v1` — 9router appends `/models`, `/chat/completions` to it. Correct for binary **and** Docker Compose on the same machine as 9router; use `http://<host-ip>:3457/v1` only when the proxy is on a different machine |
    | **API Key (for Check)** | any non-empty value (e.g. the FreeBuff token) | Used ONLY by the **Check** button. The **Create** button does not require it. With an empty proxy `API_KEYS`, any value passes |
    | **Model ID (optional)** | **leave empty** | Only for providers *without* a `/models` endpoint (falls back to a chat-completions inference test). The proxy has `GET /v1/models` — the /models check succeeds and enumerates all 12 models |
    | **Check** button | click it → expect a green **Valid** badge | 9router POSTs `/api/provider-nodes/validate` → `GET {base}/models` with your key, 10s timeout. Green = proxy reachable |
