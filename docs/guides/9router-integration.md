@@ -113,8 +113,19 @@ Data lives in `~/.9router/` (SQLite). Default port: **20128** (dashboard `/dashb
    | **Check** button | click it → expect a green **Valid** badge | 9router POSTs `/api/provider-nodes/validate` → `GET {base}/models` with your key, 10s timeout. Green = proxy reachable |
    | **Create** button | click it | POSTs `/api/provider-nodes` `{name, prefix, apiType:"chat", baseUrl, type:"openai-compatible"}` |
 
-4. After create, open the node and add the models from `/v1/models` (see §4); each is addressed as
-   `freebuff/<model-id>` (e.g. `freebuff/deepseek-v4-flash`).
+4. After **Create**, open the `freebuff` node and click **Add API Key** — for compatible providers
+   this modal has a **required** field (source: `AddApiKeyModal.js` — submit is disabled without it):
+
+   | Field | Value |
+   |---|---|
+   | Name | any label (e.g. `freebuff account`) |
+   | API Key | any non-empty value (same rule as §3) |
+   | **Default Model** | `deepseek/deepseek-v4-flash` — the **raw** model id the proxy endpoint expects (no `freebuff/` prefix; 9router passes it to `POST {base}/chat/completions` verbatim) |
+
+   This model is saved as the connection default and used for the node's validation/inference
+   tests. The other models from `/v1/models` (see §4) can be added to the node afterwards and are
+   addressed as `freebuff/<model-id>` (e.g. `freebuff/minimax-minimax-m3`… precisely
+   `freebuff/minimax/m3`-style IDs as registered — check the node's model list after adding).
 
 Equivalent raw config shape (for config-file or headless setups — 9router's custom provider
 store is the same object it persists in its DB):
