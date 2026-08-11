@@ -36,6 +36,12 @@ Sessions are **one-hour, model-bound** units. The quota depends on access tier:
    invalidate + recreate + retry once (added 2026-08-11). Cost: every model switch burns a
    fresh session from the daily quota. **Future work**: cache sessions per (token, model) so a
    working session is reused until it expires.
+
+   **UPDATE (live, 2026-08-11)**: the mismatch rejection did NOT trigger in practice. One
+   session served 9+ requests across SIX different models (deepseek-v4-flash, deepseek-v4-pro,
+   minimax-m3, gpt-5.6-luna, mimo-v2.5, glm-5.2) with the same instance id throughout —
+   `session_model_mismatch` is enforced at the CLI planner layer, not the chat API. The shared
+   per-token session design is validated live; model switching does NOT burn session quota.
 3. **429 `rate_limited`** (GLM) is passed through verbatim by the error matrix (UpstreamError
    with 429 → client sees 429 + Retry-After where present). The proxy does not track the
    "N / 5 in 20h" quota yet — surfaced only in upstream error bodies.
@@ -44,9 +50,27 @@ Sessions are **one-hour, model-bound** units. The quota depends on access tier:
    proxy on an Azure VPS IP served DeepSeek V4 Flash successfully. The 402/403 errors in the
    reference docs predate the tier rollout. `HTTP_PROXY`/`SOCKS5_PROXY` still matter for
    unlocking full mode from blocked countries.
+
+   **UPDATE (live, 2026-08-11)**: an Indonesian VPS IP (70.153.81.129, Azure) received FULL
+   access: all 12 catalog models responded 200, including premium (deepseek-v4-pro,
+   gpt-5.6-luna, minimax-m3) and GLM 5.2. Indonesia is NOT on the published 25-country list
+   (US/UK/EU/CA/AU/SG/NZ/IL/NO/SE/CH/LI/LU/MT/IS/IE/PT/ES/DK/FI/FR/DE/AT/BE/NL) — the list is
+   expanding monthly since launch (2026-02) and/or tier follows the account, not the IP.
+   Empirical rule: if a model returns 200, the account has it; the /v1/models catalog is global
+   and NOT tier-filtered by this proxy.
 5. **cost_mode**: upstream `model-config.ts` defines `costModes = ['free','lite','normal',
    'max','experimental','ask']` — `"free"` is a legitimate value, which supports the
    freebuff2api/kiprana evidence (PRD §8 A/B still open, but "free" is valid syntax).
+
+## 2b. Session & workspace semantics (live-observed)
+
+- One session (instance id) is reused across requests AND models until it expires (1h), is
+  ended/superseded, or hits a waiting room. `healthz` shows the cached session state.
+- "Workspace" is a CLI-side concept (per-project directory context + session bookkeeping);
+  the raw API flow used by this proxy has no workspace concept — chat completions carry
+  `codebuff_metadata {run_id, client_id, freebuff_instance_id}` only.
+- Waiting room: `queued` → proxy returns `503 + Retry-After`; the pool's 60s maintain ticker
+  advances queued sessions in the background. Not yet observed in live traffic (2026-08-11).
 
 ## 3. ToS constraints (freebuff.com/terms-of-service, 2026-07-23)
 
