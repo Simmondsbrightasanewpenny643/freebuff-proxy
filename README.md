@@ -1,0 +1,127 @@
+# freebuff-proxy
+
+[![CI](https://img.shields.io/github/actions/workflow/status/trefeon/freebuff-proxy/ci.yml)](https://github.com/trefeon/freebuff-proxy/actions/workflows/ci.yml)
+
+freebuff-proxy is an OpenAI-compatible proxy bridge that turns FreeBuff (Codebuff's free coding agent) into a standard API. FreeBuff's backend fingerprints official-CLI traffic and rejects direct calls with `403 free_mode_cli_required`, so the proxy replicates the CLI request envelope, manages the free-session and agent-run lifecycle upstream, and pools multiple tokens — exposing plain `/v1/chat/completions`, `/v1/models`, and `/healthz` endpoints that 9router, opencode, claude-code, or any OpenAI client can wire to as an ordinary provider.
+
+Docs: [PRD](docs/product/prd.md) · [Reference analysis](docs/research/freebuff-reference-analysis.md) · [Delivery tasks](docs/delivery/tasks.md) · [Kaspersky false-positive notes](docs/security/av-kaspersky-false-positive.md)
+
+## How it works
+
+- **CLI-envelope fingerprint injection** — each upstream request carries the `x-freebuff-model` / `x-freebuff-instance-id` headers, a `codebuff_metadata {run_id, client_id, freebuff_instance_id}` body block, and a rotating user agent, so the upstream accepts it as CLI traffic.
+- **Free-session lifecycle** — per-token single-flight session create/poll/end with automatic recreate on `ended`/`superseded`/`expired`; the waiting room is surfaced to clients as `503` + `Retry-After`.
+- **Per-agent run lifecycle** — runs are prewarmed at boot, STARTed on demand, maintained every 60s, rotated every `ROTATION_INTERVAL`, and FINISHed on rotation and shutdown.
+- **Multi-token pool** — `AUTH_TOKENS` (comma-separated) round-robin with linear failover; a token cools down for 30 minutes after a 401; when every token is queued, the token with the best waiting-room position is chosen.
+- **Live model registry** — the agent-to-model map is parsed from the `CodebuffAI/codebuff` TypeScript sources every `REGISTRY_REFRESH` (6h by default, hardcoded fallback at boot) and served via `/v1/models`.
+
+## Quick start (binary)
+
+Requires Go 1.26+ (see `go.mod`) or a prebuilt release binary.
+
+1. Build:
+
+   ```
+   go build -o freebuff-proxy.exe ./cmd/freebuff-proxy
+   ```
+
+   (Linux/macOS: `go build -o freebuff-proxy ./cmd/freebuff-proxy`.)
+
+2. Create the config file and set the upstream token:
+
+   ```
+   Copy-Item .env.example .env      # PowerShell
+   cp .env.example .env             # bash
+   ```
+
+   Edit `.env` and set `AUTH_TOKENS` — **REQUIRED**: a FreeBuff/Codebuff token, comma-separated for multiple accounts. The proxy refuses to start without at least one token.
+
+3. Run:
+
+   ```
+   .\freebuff-proxy.exe
+   ```
+
+   It listens on `:3457` (all interfaces) by default; restrict with `LISTEN_ADDR=127.0.0.1:3457` if the host is not firewalled.
+
+4. Smoke test (Windows PowerShell: use `curl.exe`):
+
+   ```
+   curl http://localhost:3457/healthz
+   curl http://localhost:3457/v1/models
+   curl -N http://localhost:3457/v1/chat/completions -H "Content-Type: application/json" -d '{"model":"deepseek/deepseek-v4-flash","messages":[{"role":"user","content":"Say hello in one short sentence."}],"stream":true}'
+   ```
+
+   `/healthz` returns uptime, model count, and the per-token pool snapshot; `/v1/models` returns the OpenAI model-list shape from the registry. The chat call streams SSE tokens back (a real token needs to be reachable upstream; a dummy `AUTH_TOKENS` fails with an upstream error, which is also expected behavior).
+
+## Quick start (Docker)
+
+1. Create `.env` from `.env.example` and set `AUTH_TOKENS` (required).
+2. Build and start:
+
+   ```
+   docker compose up --build
+   ```
+
+3. Confirm the healthcheck passes, then smoke test as in the binary quick start:
+
+   ```
+   docker compose ps
+   curl http://localhost:3457/healthz
+   ```
+
+   The compose example publishes port `3457:3457` and runs a busybox `wget` healthcheck against `/healthz` (30s interval, 10s start period). `LISTEN_ADDR` stays `:3457` inside the container — the port is published on the host. If you enable `DEBUG_DUMP=true`, mount `./dump` at `/dump` to persist captured traffic (see the commented `volumes` entry in `docker-compose.yml`).
+
+## Configuration
+
+All keys are read from the environment and override the JSON config file passed via `-config`; keys in the JSON file mirror these names. `-v` enables verbose logging.
+
+| Key | Default | Description |
+|---|---|---|
+| `AUTH_TOKENS` | _(none — REQUIRED)_ | FreeBuff auth token(s) for the upstream Codebuff API. Comma-separated for multiple accounts (round-robin + failover across tokens). |
+| `LISTEN_ADDR` | `:3457` | Listen address for the OpenAI-compatible API surface (`/v1/chat/completions`, `/v1/models`, `/healthz`). |
+| `UPSTREAM_BASE_URL` | `https://codebuff.com` | Upstream Codebuff base URL. The host is normalized to `www.codebuff.com`. |
+| `ROTATION_INTERVAL` | `6h` | How long an agent run lives upstream before it is rotated (FINISH + restart). |
+| `REQUEST_TIMEOUT` | `15m` | Timeout for a single upstream chat-completions request (stream included). |
+| `SESSION_CALL_TIMEOUT` | `30s` | Timeout for individual session / agent-run API calls (create, poll, start...). |
+| `REGISTRY_REFRESH` | `6h` | How often the model registry re-fetches the Codebuff TS sources (`free-agents.ts`, `freebuff-models.ts`, `gemini.ts`, ...). Failures keep the previous mapping (or the hardcoded fallback at boot). |
+| `API_KEYS` | _(empty — no client auth)_ | Optional: API keys clients must present (`Authorization: Bearer` or `x-api-key`). Comma-separated. Empty = no client auth. |
+| `HTTP_PROXY` | _(empty)_ | Outbound HTTP/HTTPS proxy (CONNECT tunneling). Empty = direct. |
+| `SOCKS5_PROXY` | _(empty)_ | Outbound SOCKS5 proxy (e.g. `socks5://127.0.0.1:1080`). Empty = direct. |
+| `COST_MODE` | _(empty — omit)_ | `cost_mode` sent upstream with chat requests: "" (omit — proxy-freebuff's 2026-08 behavior) or "free". Empirical A/B pending, see PRD §8. |
+| `DEBUG_DUMP` | `false` | Dump raw upstream request/response traffic into `./dump` for debugging. |
+| `LOG_FILE` | _(empty — stderr only)_ | Optional log file path (in addition to stderr). Empty = stderr only. |
+
+## 9router integration
+
+Add freebuff-proxy as a provider in 9router's configuration; adjust `models` to entries from `/v1/models`:
+
+```json
+{ "freebuff": { "base_url": "http://localhost:3457/v1", "api_key": "user_...", "models": ["deepseek/deepseek-v4-flash"] } }
+```
+
+- `api_key` can be any configured `API_KEYS` value; when no `API_KEYS` are set the proxy accepts any key, so any placeholder works.
+- The model list is served live by `/v1/models` (parsed from upstream TS sources, refreshed every 6h).
+
+## Testing against the mock upstream
+
+The test suite runs against a mock Codebuff upstream (`internal/testutil`) — no real token needed:
+
+```
+go test ./...
+```
+
+CI runs `go vet` and `go test -race ./...` on Linux (the race detector needs a C toolchain, hence CI-only). On this Windows dev machine, Kaspersky may quarantine freshly linked test binaries out of the go-build cache (`fork/exec ... Access is denied`); that is a validated false positive — see [docs/security/av-kaspersky-false-positive.md](docs/security/av-kaspersky-false-positive.md) for workarounds (add a Kaspersky exclusion for the `go-build*` cache path, or `go test -c -o out\convert.test.exe ./internal/convert` + run it directly).
+
+## Troubleshooting
+
+| Symptom | Cause / fix |
+|---|---|
+| `403 free_mode_cli_required` | The CLI envelope did not satisfy the anti-bot gate. Check `COST_MODE` (omit vs `"free"` — A/B pending, see PRD §8) and the `client_id` format (13-char base36). |
+| `402 Out of credits` / `403 country_blocked` | Geo-gating: blocked-country / VPN / datacenter IPs are rejected upstream. Use `HTTP_PROXY` or `SOCKS5_PROXY` with a clean residential egress. |
+| `503` with `waiting_room_queued` | Normal: the free session is queued in the waiting room. The `Retry-After` header tells the client when to retry; 9router and opencode retry automatically. |
+| `502 upstream_unavailable` | Every token failed or is in cooldown. Check token validity — a 401 puts a token in a 30-minute cooldown. |
+| Antivirus (e.g. Kaspersky) flags test binaries or the `.exe` | False positive; Go binaries trip AV heuristics. See [docs/security/av-kaspersky-false-positive.md](docs/security/av-kaspersky-false-positive.md). |
+
+## Terms of use
+
+FreeBuff is only intended to be used through the official CLI. This proxy uses undocumented upstream endpoints and replicates CLI fingerprints, which conflicts with the letter of the service terms; account bans are possible. Use it for educational and personal experimentation at your own risk, and keep usage modest. This project is not affiliated with or endorsed by Codebuff.

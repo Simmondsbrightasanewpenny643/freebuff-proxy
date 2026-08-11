@@ -1,0 +1,25 @@
+# Example deployment for the FreeBuff proxy bridge.
+#
+# .env is REQUIRED: copy .env.example to .env and set AUTH_TOKENS (a
+# FreeBuff/Codebuff token; comma-separated for multiple accounts). The proxy
+# refuses to start without at least one token.
+#
+# The container runs as a non-root user and the binary writes nothing to its
+# own filesystem by default. If you enable DEBUG_DUMP=true, uncomment the
+# volumes entry below to persist captured traffic in ./dump.
+
+services:
+  freebuff-proxy:
+    build: .
+    env_file: .env
+    ports:
+      - "3457:3457"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:3457/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    # volumes:
+    #   - ./dump:/dump

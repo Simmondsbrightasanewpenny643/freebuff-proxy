@@ -1,0 +1,8 @@
+.git
+reference/
+dump/
+dist/
+out/
+*.log
+.env
+config.json
