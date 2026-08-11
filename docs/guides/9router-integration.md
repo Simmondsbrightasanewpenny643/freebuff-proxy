@@ -111,7 +111,17 @@ Data lives in `~/.9router/` (SQLite). Default port: **20128** (dashboard `/dashb
    | **API Key (for Check)** | any non-empty value (e.g. the FreeBuff token) | Used ONLY by the **Check** button. The **Create** button does not require it. With an empty proxy `API_KEYS`, any value passes |
    | **Model ID (optional)** | **leave empty** | Only for providers *without* a `/models` endpoint (falls back to a chat-completions inference test). The proxy has `GET /v1/models` — the /models check succeeds and enumerates all 12 models |
    | **Check** button | click it → expect a green **Valid** badge | 9router POSTs `/api/provider-nodes/validate` → `GET {base}/models` with your key, 10s timeout. Green = proxy reachable |
-   | **Create** button | click it | POSTs `/api/provider-nodes` `{name, prefix, apiType:"chat", baseUrl, type:"openai-compatible"}` |
+   | **Create** button | click it | POSTs `/api/provider-nodes` `{name, prefix, apiType:"chat", baseUrl, type:"openai-compatible"}` — does NOT run the URL check |
+
+   > **"URL not allowed" / Invalid on Check? — ignore it and hit Create.** 9router's
+   > `/api/provider-nodes/validate` has an **SSRF guard** (`assertPublicUrl`): when you open the
+   > dashboard from a *different machine* than the one running 9router (e.g. browsing
+   > `http://192.168.10.3:20128` from your laptop), private base URLs (`127.0.0.1`, `172.17.x`,
+   > `192.168.x`, `10.x`) are rejected with `URL not allowed`. That is expected — the proxy is
+   > still reachable at runtime. **Create** does not validate the URL (only name/prefix/baseUrl
+   > are required), so create the node anyway and do the real configuration in the next step
+   > (Add API Key), which validates through `/api/providers/validate` — **no SSRF guard** —
+   > so private URLs pass there.
 
 4. After **Create**, open the `freebuff` node and click **Add API Key** — for compatible providers
    this modal has a **required** field (source: `AddApiKeyModal.js` — submit is disabled without it):
