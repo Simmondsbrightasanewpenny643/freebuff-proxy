@@ -42,6 +42,9 @@ irm https://raw.githubusercontent.com/trefeon/freebuff-proxy/main/scripts/instal
 
 Follow the prompts to pick your token or enable bridge mode.
 
+#### How to obtain your FreeBuff token (`authToken`):
+- **CLI (Recommended):** Run `npm i -g freebuff` and `freebuff` to log in. The CLI saves your `authToken` in `~/.config/manicode/credentials.json`.
+- **Web:** Log in at `https://freebuff.llm.pm` -> **Freebuff Auth** -> **Generate login URL** (`https://freebuff.com/login?auth_code=...`). Open the link to authenticate.
 ---
 
 ### Option B: Docker Compose
