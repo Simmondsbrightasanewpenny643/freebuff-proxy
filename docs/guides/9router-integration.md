@@ -74,6 +74,31 @@ WantedBy=multi-user.target
 sudo cp freebuff-proxy.service /etc/systemd/system/ && sudo systemctl enable --now freebuff-proxy
 ```
 
+### 1.1 Bridge mode (no proxy token)
+
+Don't want to put your FreeBuff token in the proxy's `.env`? Leave `AUTH_TOKENS=` **empty**
+(bridge mode) — the proxy holds no token of its own and relays each request with the token
+the client sends:
+
+- 9router **API Key** (node + Add API Key): use **your FreeBuff token** (not a placeholder).
+  9router forwards it as `Authorization: Bearer <key>`, and the proxy relays that exact
+  token upstream. One 9router key = one proxy session = one FreeBuff account.
+- Everything else (Base URL, API Type, Model ID, Default Model) is unchanged from sections 1/3.
+- `/v1/models` and `/healthz` need no header; `API_KEYS` is ignored in bridge mode.
+- Sessions/runs are created lazily per token and reused; the cache is capped at 32 tokens
+  with LRU eviction and ~2h idle eviction. Ban/quota errors stay per account (403/429/503).
+- Want several FreeBuff accounts? Add several 9router keys — each carries its own token.
+
+Verify with curl before touching 9router (no token needed for models/healthz):
+
+```bash
+curl http://127.0.0.1:3457/healthz   # {"models":15,"tokens":[],"bridge_tokens":0,...}
+curl -N http://127.0.0.1:3457/v1/chat/completions \
+  -H "Authorization: Bearer <your-freebuff-token>" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"deepseek/deepseek-v4-flash","messages":[{"role":"user","content":"hi"}],"stream":true}'
+```
+
 ---
 
 ## 2. Install 9router
