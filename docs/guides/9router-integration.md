@@ -11,14 +11,18 @@ an ordinary **OpenAI-compatible custom provider**.
 freebuff-proxy (:3457, OpenAI-compatible surface)
    │  x-freebuff-model / x-freebuff-instance-id / codebuff_metadata envelope
    ▼
-codebuff.com (FreeBuff free tier — token-bound)
+codebuff.com (FreeBuff free tier, token-bound)
 ```
+
+This guide documents every option that exists in 9router v0.5.50 (2026-08-05) for adding and
+running a custom provider. Option names and defaults below were verified against the 9router
+source code (dashboard modals, API routes, `open-sse/` fallback engine, `.env.example`).
 
 ---
 
-## 1. Prerequisites — the proxy must be running and reachable
+## 1. Prerequisites: the proxy must be running and reachable
 
-1. Get a token (see README → *Getting a token*: `freebuff.llm.pm` or
+1. Get a token (see README, *Getting a token*: `freebuff.llm.pm` or
    `~/.config/manicode/credentials.json`).
 2. Run freebuff-proxy **with the token** (any of these):
    - **Same machine as 9router (recommended):** build + run, or the systemd unit below
@@ -32,17 +36,17 @@ codebuff.com (FreeBuff free tier — token-bound)
    curl http://127.0.0.1:3457/v1/models   # the model catalog (~15 at boot)
    ```
 
-**Base URL — which one to use in 9router:** the proxy listens on port **3457**; only the
+**Base URL, which one to use in 9router:** the proxy listens on port **3457**; only the
 *host* part of the URL changes:
 
 | Where the proxy runs | Base URL in 9router |
 |---|---|
-| **Same machine as 9router** — plain process (binary / systemd) **or** Docker Compose | `http://127.0.0.1:3457/v1` |
-| **9router itself runs in Docker** on the same host | `http://<docker-bridge-gateway>:3457/v1` — from inside a container the host is the bridge gateway (commonly `172.17.0.1`/`172.18.0.1`; find it: `docker network inspect <proxy-network> --format '{{(index .IPAM.Config 0).Gateway}}'`) |
+| **Same machine as 9router**, plain process (binary / systemd) **or** Docker Compose | `http://127.0.0.1:3457/v1` |
+| **9router itself runs in Docker** on the same host | `http://<docker-bridge-gateway>:3457/v1`; from inside a container the host is the bridge gateway (commonly `172.17.0.1`/`172.18.0.1`; find it: `docker network inspect <proxy-network> --format '{{(index .IPAM.Config 0).Gateway}}'`) |
 | **Another machine on your LAN** (e.g. a homelab box) | `http://<that-host-ip>:3457/v1` (e.g. `http://192.168.10.3:3457/v1`) |
 | **A VPS / remote server** | `http://<vps-ip-or-domain>:3457/v1` (firewall must allow 3457; if the container binds loopback, set `LISTEN_ADDR=:3457` in its env) |
 
-**When in doubt, use `http://127.0.0.1:3457/v1`** — it is correct whenever the proxy runs on
+**When in doubt, use `http://127.0.0.1:3457/v1`**; it is correct whenever the proxy runs on
 the same machine as 9router *as a plain process*. If 9router is containerized, use the
 gateway IP above (the `scripts/setup-proxy-docker.sh` installer detects and prints it for
 you).
@@ -74,14 +78,14 @@ sudo cp freebuff-proxy.service /etc/systemd/system/ && sudo systemctl enable --n
 
 ## 2. Install 9router
 
-**Option A — npm (quickest):**
+**Option A, npm (quickest):**
 
 ```bash
 npm install -g 9router
 9router          # dashboard opens at http://localhost:20128
 ```
 
-**Option B — from source:**
+**Option B, from source:**
 
 ```bash
 git clone https://github.com/decolua/9router && cd 9router
@@ -91,8 +95,37 @@ npm run build
 PORT=20128 HOSTNAME=0.0.0.0 npm run start
 ```
 
-Data lives in `~/.9router/` (SQLite). Default port: **20128** (dashboard `/dashboard`, API `/v1`).
-**Set `INITIAL_PASSWORD` and `JWT_SECRET`** — the default password is a known value.
+Data lives in `DATA_DIR` (SQLite). Default port: **20128** (dashboard `/dashboard`, API `/v1`).
+On first run (v0.5.50+) 9router auto-provisions a **Default Key** for the dashboard.
+
+### Environment options (from `.env.example` / source)
+
+| Variable | Default | Notes |
+|---|---|---|
+| `JWT_SECRET` | auto-generated file | Dashboard session signing. Required for stable sessions; without it 9router writes `DATA_DIR/jwt-secret` and sessions reset when it rotates |
+| `INITIAL_PASSWORD` | `123456` | Dashboard login password on first run. **Change it.** |
+| `DATA_DIR` | `~/.9router` | Data directory. Windows: `%APPDATA%/9router`; Docker: `/app/data`. Unix-style paths are ignored on Windows |
+| `PORT` | `20128` | HTTP port |
+| `HOSTNAME` | `0.0.0.0` (prod) | Bind address |
+| `NODE_ENV` | `production` | `development` enables dev-only behavior |
+| `API_KEY_SECRET` | auto | Secret for hashing client API keys at rest |
+| `MACHINE_ID_SALT` | auto | Salt for machine-bound key generation |
+| `ENABLE_REQUEST_LOGS` | off | Per-request logging |
+| `OBSERVABILITY_ENABLED` | off | OpenTelemetry export (documented inconsistently; check the env example) |
+| `AUTH_COOKIE_SECURE` | off | Set when serving dashboard over HTTPS |
+| `REQUIRE_API_KEY` | on | When off, clients can call `/v1` without a key ("local mode") |
+| `BASE_URL` / `CLOUD_URL` |  | Public URL / cloud mode (not needed for local use) |
+| `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY` / `NO_PROXY` |  | Outbound proxy for 9router's own upstream calls (not per-provider) |
+| `SEARXNG_URL` |  | Optional search backend for `/v1/search` |
+| `HEADROOM_URL` | `http://localhost:8787` | Companion token-saver service (see RTK section) |
+
+Runtime timeouts (configurable): `STREAM_STALL_TIMEOUT_MS` (360000), `STREAM_FIRST_CHUNK_TIMEOUT_MS`
+(200000), `FETCH_CONNECT_TIMEOUT_MS` (60000). CLI flags: `--port`, `--no-browser`,
+`--skip-update`.
+
+Dashboard settings (Settings page, stored in the DB): `requireLogin`, `requireApiKey`
+(both default on), `authMode` (`password` or `oidc`), tunnel/tailscale/cloud-sync,
+outboundProxy, observability, quotaVisibility, dnsToolEnabled.
 
 ---
 
@@ -100,45 +133,63 @@ Data lives in `~/.9router/` (SQLite). Default port: **20128** (dashboard `/dashb
 
 1. Open **http://localhost:20128/dashboard/providers**
 2. Under **Custom Providers (OpenAI/Anthropic Compatible)** click **Add OpenAI Compatible**
-3. Fill the form **exactly** (verified against the 9router source, `AddCompatibleModal.js`):
+3. Fill the form. Field-by-field (verified against `AddCompatibleModal.js`):
 
-   | Field | Value | Why (from 9router source) |
+   | Field | Value for freebuff-proxy | Why (from 9router source) |
    |---|---|---|
    | **Name** | `freebuff` | Required. Friendly label only. |
    | **Prefix** | `freebuff` | Required. Becomes the model-id prefix: model combos are `freebuff/<model-id>` |
-   | **API Type** | **Chat Completions** | Keep the default `chat`. The proxy implements `/v1/chat/completions` only — **Responses API is NOT supported**; choosing it makes every request 404 |
-   | **Base URL** | **default: `http://127.0.0.1:3457/v1`** — see the host table in §1; if 9router runs **in Docker**, use `http://<docker-gateway>:3457/v1` instead (detected automatically by `scripts/setup-proxy-docker.sh`) | Must end in `/v1` — 9router appends `/models`, `/chat/completions` to it |
-   | **API Key (for Check)** | any non-empty value (e.g. the FreeBuff token) | Used ONLY by the **Check** button. The **Create** button does not require it. With an empty proxy `API_KEYS`, any value passes |
-   | **Model ID (optional)** | **leave empty** | Only for providers *without* a `/models` endpoint (falls back to a chat-completions inference test). The proxy has `GET /v1/models` — the /models check succeeds and enumerates the catalog (15 models at boot) |
-   | **Check** button | click it → expect a green **Valid** badge | 9router POSTs `/api/provider-nodes/validate` → `GET {base}/models` with your key, 10s timeout. Green = proxy reachable |
-   | **Create** button | click it | POSTs `/api/provider-nodes` `{name, prefix, apiType:"chat", baseUrl, type:"openai-compatible"}` — does NOT run the URL check |
+   | **API Type** | **Chat Completions** | `chat` only. The proxy implements `/v1/chat/completions`; **Responses API (`responses`) is NOT supported** and makes every request 404 |
+   | **Base URL** | see the host table in section 1; must end in `/v1` | 9router appends `/models`, `/chat/completions` to it at runtime |
+   | **API Key (for Check)** | any non-empty value (e.g. the FreeBuff token) | Used ONLY by the **Check** button; it is **not saved** with the node. Empty proxy `API_KEYS` accepts any value |
+   | **Model ID (optional)** | **leave empty** | Fallback model used for validation when the provider has no `/models` endpoint. The proxy has `GET /v1/models`, so the /models check succeeds and enumerates the catalog (15 models at boot) |
 
-   > **"URL not allowed" / Invalid on Check? — ignore it and hit Create.** 9router's
-   > `/api/provider-nodes/validate` has an **SSRF guard** (`assertPublicUrl`): when you open the
-   > dashboard from a *different machine* than the one running 9router (e.g. browsing
-   > `http://192.168.10.3:20128` from your laptop), private base URLs (`127.0.0.1`, `172.17.x`,
-   > `192.168.x`, `10.x`) are rejected with `URL not allowed`. That is expected — the proxy is
-   > still reachable at runtime. **Create** does not validate the URL (only name/prefix/baseUrl
-   > are required), so create the node anyway and do the real configuration in the next step
-   > (Add API Key), which validates through `/api/providers/validate` — **no SSRF guard** —
-   > so private URLs pass there.
+   What the **Check** button does: `POST /api/provider-nodes/validate` sends `{baseUrl,
+   apiKey, type, modelId}` and 9router does `GET {base}/models` (Bearer), falling back to
+   `POST {base}/chat/completions`; 10s timeout. Green badge = proxy reachable.
 
-4. After **Create**, open the `freebuff` node and click **Add API Key** — for compatible providers
-   this modal has a **required** field (source: `AddApiKeyModal.js` — submit is disabled without it):
+   > **SSRF guard: local vs remote dashboard.** The validation endpoint runs
+   > `assertPublicUrl`, which rejects private base URLs (`127.0.0.1`, `172.17.x`, `192.168.x`,
+   > `10.x`), but **only when the dashboard request is not local**. From a browser on the
+   > same machine as 9router, `http://127.0.0.1:3457/v1` validates fine. From a *different
+   > machine* (e.g. browsing `http://192.168.10.3:20128` from your laptop), the same URL is
+   > rejected with "URL not allowed" even though the proxy is reachable. The **Create**
+   > button does not validate the URL (only name/prefix/baseUrl are required), so create the
+   > node anyway; the real configuration happens in the next step (Add API Key), which
+   > validates through `POST /api/providers/validate` with **no SSRF guard**, so private URLs
+   > pass there. If you insist on Check passing from a remote dashboard, use a public URL
+   > (reverse proxy or tunnel).
 
-   | Field | Value |
-   |---|---|
-   | Name | any label (e.g. `freebuff account`) |
-   | API Key | any non-empty value (same rule as §3) |
-   | **Default Model** | `deepseek/deepseek-v4-flash` — the **raw** model id the proxy endpoint expects (no `freebuff/` prefix; 9router passes it to `POST {base}/chat/completions` verbatim) |
+   **Create** saves `POST /api/provider-nodes` `{name, prefix, apiType:"chat", baseUrl,
+   type:"openai-compatible"}`; no key is stored on the node, so you must add one next.
 
-   This model is saved as the connection default and used for the node's validation/inference
-   tests. The other models from `/v1/models` (see §4) can be added to the node afterwards and are
-   addressed as `freebuff/<model-id>` (e.g. `freebuff/minimax-minimax-m3`… precisely
-   `freebuff/minimax/m3`-style IDs as registered — check the node's model list after adding).
+4. After **Create**, open the `freebuff` node and click **Add API Key** (verified against
+   `AddApiKeyModal.js`):
 
-Equivalent raw config shape (for config-file or headless setups — 9router's custom provider
-store is the same object it persists in its DB):
+   | Field | Value | Notes |
+   |---|---|---|
+   | **Name** | any label (e.g. `freebuff account`) | Required for compatible providers; the submit button is disabled without it |
+   | **API Key** | any non-empty value | Same rule as section 3. Required |
+   | **Region (optional)** | leave empty | Only for providers that define regions |
+   | **Default Model** | `deepseek/deepseek-v4-flash` | **Required for compatible nodes.** The **raw** model id the proxy endpoint expects (no `freebuff/` prefix; 9router passes it to `POST {base}/chat/completions` verbatim) |
+   | **Priority** | `1` (default) | Integer. Lower number wins; with several keys it is priority-order fallback (or round-robin, see section 5) |
+   | **Proxy Pool** | `__none__` (default) | Optional outbound proxy pool for this connection (9router's own proxies, not the proxy's `HTTP_PROXY`) |
+
+   **Bulk mode**: paste `name|apiKey` lines into the textarea to add many keys at once
+   (a bare key on a line is auto-named `Key N`). Save payload:
+   `{name, apiKey, defaultModel, priority, proxyPoolId, testStatus}`.
+
+   **Multiple keys per node**: supported. Each key becomes a separate connection row used in
+   priority order, or round-robin if you enable the provider's round-robin toggle. You can
+   point several FreeBuff tokens here, but the proxy already pools tokens itself, so one
+   connection with a placeholder key is enough.
+
+   The **Default Model** is used for the node's validation and inference tests. Other models
+   from `/v1/models` (section 6) can be added to the node afterwards and are addressed as
+   `freebuff/<model-id>`.
+
+Equivalent raw config shape (config-file or headless setups; this is the object 9router
+persists in its DB):
 
 ```json
 {
@@ -152,7 +203,109 @@ store is the same object it persists in its DB):
 
 ---
 
-## 4. Model catalog (boot fallback, 2026-08-12)
+## 4. Manage the node after creation (all options)
+
+On the provider page, per node and per connection (verified against `providers/[id]/page.js`):
+
+- **Edit node**: change name / prefix / API type / base URL. Edits are propagated into every
+  connection's `providerSpecificData.{prefix, apiType, baseUrl, nodeName}`.
+- **Delete node**: cascades to all connections.
+- **Connection row**:
+  - **Active toggle** (`isActive`): take the key out of rotation without deleting it.
+  - **Priority up/down**: reorder keys; with round-robin off, 9router tries them in order.
+  - **Test** per connection: `POST /api/providers/[id]/test` runs a one-off probe with that
+    key (this is the SSRF-free validation path).
+  - **Test all** (one by one), **bulk delete**.
+  - **Apply Proxy**: bind a single proxy pool, rotate across pools, or unbind.
+- **Round Robin toggle** (per provider): rotates across connections per request instead of
+  strict priority. Global default sticky limit: `stickyRoundRobinLimit: 3` (same connection
+  serves up to N consecutive requests before rotating).
+- **Models section** (compatible providers use the custom-models list):
+  - **Add Model** (`AddCustomModelModal`): `POST /api/models/custom {providerAlias, id,
+    type}`; add any catalog id from section 6.
+  - **Aliases**: map an alias to a real model id (`POST /api/models/alias`) so you can expose
+    e.g. `freebuff/flash` instead of `freebuff/deepseek/deepseek-v4-flash`.
+  - **Disable / enable** individual models without deleting them.
+  - **Test model**: probe a single model through the node.
+  - **Suggested models import**: pull the catalog the proxy advertises via `/v1/models`.
+
+---
+
+## 5. Combos and fallback tiers
+
+A **combo** is an ordered list of model strings with a name (`^[a-zA-Z0-9_.\-]+$`, unique);
+`kind` is optional. **Tiers are a README concept, not a field**: ordering is just list
+position, so a custom provider's models slot in anywhere (e.g. `freebuff/...` after your paid
+providers, before nothing, or as a dedicated free tier).
+
+- **Global strategy** (`comboStrategy`, default `fallback`): try models in list order.
+- **Per-combo overrides** (`fallbackStrategy`): `round-robin` or `fusion` (combine several
+  responses; needs `judgeModel` / `fusionTuning`).
+- **Round-robin stickiness**: `comboStickyRoundRobinLimit`, default 1.
+- **Capability auto-switch**: 9router reorders for vision/pdf/audio/video based on request
+  content; the capacity adapter defaults to vision/audio enabled with
+  `oc/mimo-v2.5-free` fallback.
+
+**Retire / skip / backoff rules** (verified against `accountFallback.js` + `errorConfig.js`):
+
+| Signal | 9router behavior |
+|---|---|
+| `401` / `402` / `403` / `404` from a connection | Connection locked for 2 minutes; next connection tried |
+| `429` rate limit | Exponential backoff: 2s x 2^n, max 5 min |
+| Text rules: rate limit / quota / capacity / overloaded | Same backoff, applied at level <= 15 |
+| "No credentials" | Connection skipped for 2 minutes |
+| `502` / `503` / `504` | Wait up to 5s between tries |
+| All models failed | Client gets `503` with the earliest `retryAfter` |
+| Per-model locks | A failing model is locked per `modelLock_<model>` so other models keep working |
+
+The proxy itself also returns `503 waiting_room_queued` + `Retry-After` and
+`429 rate_limited` + `resetAt`, which 9router's fallback engine understands.
+
+---
+
+## 6. RTK token saver and companion savers
+
+**RTK token saver** compresses `tool_result` content **in place, before format translation**
+(OpenAI `role:"tool"` messages, Claude `tool_result` blocks, Responses
+`function_call_output`). Filters: git-diff, git-status, git-log, grep, find, ls, tree,
+dedup-log, smart-truncate, read-numbered, search-list. It auto-detects content (peeks 1KB),
+never grows or empties a result, and respects `MIN_COMPRESS_SIZE` / `RAW_CAP`.
+
+- **Default: enabled** (`rtkEnabled: true`). Toggle in Dashboard -> Endpoint settings.
+- **Per-request bypass**: send header `x-9router-token-saver: off`.
+- **Why it matters here**: compressing `tool_result` before it reaches the proxy saves
+  FreeBuff quota too. Leave it on.
+
+Companion savers (settings-row flags, off by default): **headroom** (`headroomEnabled`,
+`headroomUrl` default `http://localhost:8787`), **caveman** (`cavemanEnabled/Level`),
+**ponytail** (`ponytailEnabled/Level`), pxpipe.
+
+---
+
+## 7. Client access (other OpenAI clients)
+
+Any OpenAI client can use 9router as its endpoint:
+
+| Setting | Value |
+|---|---|
+| Base URL | `http://localhost:20128/v1` |
+| API key | any key from the dashboard Keys page (or none if `requireApiKey` is off, "local mode") |
+| Auth | `Authorization: Bearer <key>` |
+
+Public API prefixes: `/v1`, `/v1beta`, `/api/v1`, `/codex`. Available routes (9router side):
+`/v1/chat/completions`, `/v1/responses` (+`/compact`), `/v1/messages` (+`/count_tokens`),
+`/v1/models` (+`/[kind]`, `/info`), `/v1/embeddings`, `/v1/audio/{speech,transcriptions,
+voices}`, `/v1/images/generations`, `/v1/videos/*`, `/v1/search`, `/v1/web/fetch`.
+
+Model ids on the client side: `<provider-prefix>/<model>` (e.g.
+`freebuff/deepseek/deepseek-v4-flash`), or a combo name alone.
+
+> The proxy only implements chat completions + models. If you call 9router's `/v1/responses`
+> or `/v1/messages` with a freebuff model, 9router falls back to other providers or errors.
+
+---
+
+## 8. Model catalog (boot fallback, 2026-08-12)
 
 Served by `GET /v1/models` (parsed from `CodebuffAI/codebuff` TS sources, refreshed every 6h,
 fallback at boot). Register any subset in 9router:
@@ -165,26 +318,26 @@ fallback at boot). Register any subset in 9router:
 | `minimax/minimax-m3` | full access; fast + image support |
 | `mimo/mimo-v2.5` | full **and** limited access |
 | `z-ai/glm-5.2` | earned sessions; **rate-limited to 5 sessions / 20h** (HTTP 429 `rate_limited`) |
-| `poolside/laguna-s-2.1`, `openrouter/poolside/laguna-s-2.1` | catalog additions since 2026-08 — pending tier probing |
-| `inclusionai/ling-3.0-flash:free` | catalog addition — pending tier probing |
-| `crof/greg-2-ultra`, `crof/greg-2-super` | catalog additions — pending tier probing |
+| `poolside/laguna-s-2.1`, `openrouter/poolside/laguna-s-2.1` | catalog additions since 2026-08; pending tier probing |
+| `inclusionai/ling-3.0-flash:free` | catalog addition; pending tier probing |
+| `crof/greg-2-ultra`, `crof/greg-2-super` | catalog additions; pending tier probing |
 | `anthropic/claude-fable-5` | catalog addition; may be restricted per tier |
-| `google/gemini-2.5/3.1/3.5-flash-lite` | specialist subagents (file finding/research) — not a general chat model |
+| `google/gemini-2.5/3.1/3.5-flash-lite` | specialist subagents (file finding/research); not a general chat model |
 
-> The live catalog refreshes every 6h and can differ slightly from this boot fallback —
+> The live catalog refreshes every 6h and can differ slightly from this boot fallback;
 > always trust `GET /v1/models` for the current list.
 
 Quota reality (local dev note: `docs/research/freebuff-limitations.md`, gitignored):
 - **Limited mode** (some regions / VPN / datacenter IPs): DeepSeek V4 Flash + MiMo 2.5 only,
   6 one-hour sessions/day.
 - **Full mode**: all models; ~5 one-hour sessions/day for premium models (MiniMax unlimited,
-  GLM 5/20h). One proxy session serves many requests across models, so a normal day burns 1–3.
-- The proxy does **not** tier-filter `/v1/models` — a model that errors upstream is a
+  GLM 5/20h). One proxy session serves many requests across models, so a normal day burns 1-3.
+- The proxy does **not** tier-filter `/v1/models`; a model that errors upstream is a
   tier/quota issue, not a proxy bug.
 
 ---
 
-## 5. Verification
+## 9. Verification
 
 Through 9router (the model id carries the provider prefix):
 
@@ -195,40 +348,47 @@ curl -N http://localhost:20128/v1/chat/completions \
   -d '{"model":"freebuff/deepseek-v4-flash","messages":[{"role":"user","content":"hi"}],"stream":true}'
 ```
 
-Also verify in the 9router dashboard chat: pick `freebuff/deepseek-v4-flash` and send a message.
+Also verify in the 9router dashboard chat: pick `freebuff/deepseek-v4-flash` and send a
+message.
 
 **9router settings that matter:**
-- **RTK token saver** — leave enabled (it compresses `tool_result` before it reaches the
+- **RTK token saver**: leave enabled (it compresses `tool_result` before it reaches the
   proxy; saves FreeBuff quota too).
-- **max_tokens**: reasoning models think before they answer — set a generous
-  `max_tokens` (≥ 4k) for `deepseek-*`, `gpt-5.6-luna`, `glm-5.2` or tool calls get truncated
+- **max_tokens**: reasoning models think before they answer; set a generous `max_tokens`
+  (>= 4k) for `deepseek-*`, `gpt-5.6-luna`, `glm-5.2` or tool calls get truncated
   (`finish_reason: "length"`, observed live).
-- **Fallback tiers**: freebuff fits a FREE tier (Tier 3) under your paid providers in 9router
-  combo/fallback chains.
+- **Fallback tiers**: freebuff fits a FREE tier under your paid providers in 9router
+  combo/fallback chains (see section 5).
 
 ---
 
-## 6. Troubleshooting
+## 10. Troubleshooting
 
 | Symptom | Cause / fix |
 |---|---|
 | 9router: connection refused on base_url | Proxy not running, wrong port, or firewall. Check `systemctl status freebuff-proxy` / `docker compose ps`; `curl http://127.0.0.1:3457/healthz` |
-| 401 from the proxy | `API_KEYS` is set in the proxy `.env` and 9router's api_key doesn't match one of them |
-| `400 model_not_found` (proxy) | Model not in the registry catalog — check `/v1/models` |
-| `404 unknown model` (9router) | The model combo isn't registered — re-add the model in the provider config |
+| "URL not allowed" on **Check** from a remote browser | The SSRF guard rejects private URLs for non-local dashboard requests (section 3). Click Create anyway and validate via **Add API Key**, which has no SSRF guard; or use a public URL |
+| 401 from the proxy | `API_KEYS` is set in the proxy `.env` and 9router's api_key does not match one of them |
+| `400 model_not_found` (proxy) | Model not in the registry catalog. Check `/v1/models` |
+| `404 unknown model` (9router) | The model combo is not registered. Re-add the model in the provider config |
 | `503 waiting_room_queued` + Retry-After | FreeBuff waiting room (quota/hourly). Normal; 9router/opencode retry automatically |
-| `429` with `rate_limited` | GLM 5/20h cap — switch model or wait |
-| `502 upstream_unavailable` | Token in 30-min cooldown after a 401, or all tokens failed — check `healthz` |
+| `429` with `rate_limited` | GLM 5/20h cap, or token daily quota (6 sessions on the limited tier). Switch model or wait; 9router backs off with the proxy's `resetAt` |
+| `502 upstream_unavailable` | Token in 30-min cooldown after a 401, or all tokens failed. Check `healthz` |
 | Model streams `reasoning_content` | By design (CLI-faithful). 9router handles it; don't strip it |
 | 9router shows provider disconnected | Proxy restarted mid-flight; sessions recover transparently on the next request |
+| Every request returns `404` | Provider API type is set to **Responses**; the proxy only implements Chat Completions (section 3) |
+| Can't log in to the dashboard | `INITIAL_PASSWORD` default is `123456`; change it. If `JWT_SECRET` rotates, sessions reset |
 
 ---
 
-## 7. References
+## 11. References
 
-- This project: README (getting a token, config table), this guide — the PRD, reference
-  analysis and quota-research notes are **local-only dev docs** (gitignored)
+- This project: README (getting a token, config table), this guide. The PRD, reference
+  analysis and quota-research notes are **local-only dev docs** (gitignored).
 - 9router: github.com/decolua/9router (`npm i -g 9router`, dashboard on :20128, data in
-  `~/.9router/`)
-- ToS note: FreeBuff's terms prohibit third-party wrappers/endpoints — educational/personal
+  `~/.9router/`; v0.5.50, 2026-08-05). Option inventory in this guide was verified against
+  `AddCompatibleModal.js`, `AddApiKeyModal.js`, `providers/[id]/page.js`,
+  `open-sse/{services/combo.js,services/accountFallback.js,rtk/index.js}`,
+  `src/lib/db/repos/settingsRepo.js`, `.env.example`, CHANGELOG.
+- ToS note: FreeBuff's terms prohibit third-party wrappers/endpoints; educational/personal
   use only, bans possible. Keep usage modest.
