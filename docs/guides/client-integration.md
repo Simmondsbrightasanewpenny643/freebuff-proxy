@@ -7,6 +7,12 @@ Connect any OpenAI-compatible AI tool or coding assistant to `freebuff-proxy`.
 
 ---
 
+## Bridge Mode vs Pooled Mode
+
++ **Pooled Mode (Default):** Set `AUTH_TOKENS=token1,token2` in the proxy's `.env`. The proxy manages token rotation, and clients can use any placeholder API key.
++ **Bridge Mode (Routers & Multi-User):** Leave `AUTH_TOKENS=` empty in `.env`. The proxy acts as a zero-storage relay. **API Routers (9router, OmniRouter, One API, LiteLLM) send actual FreeBuff tokens in `Authorization: Bearer <freebuff-token>`.** The proxy lazily creates sessions per client token with LRU caching, rate limits, and health tracking.
+---
+
 ## 1. Continue (VS Code & JetBrains Extension)
 
 Edit `~/.continue/config.json`:
@@ -123,6 +129,18 @@ const response = await openai.chat.completions.create({
 for await (const chunk of response) {
   process.stdout.write(chunk.choices[0]?.delta?.content || '');
 }
+---
+
+## 7. API Routers & Aggregators (9router, OmniRouter, One API, LiteLLM)
+
+For multi-account management or multi-user API routing:
+
+1. **Proxy Setup:** Run the proxy in **Bridge Mode** (leave `AUTH_TOKENS=` empty in `.env`).
+2. **Router Setup (9router / OmniRouter):**
+   + **Provider Type:** OpenAI Compatible
+   + **Base URL:** `http://localhost:3457/v1` (or container host `http://host.docker.internal:3457/v1`)
+   + **API Keys:** Add your actual **FreeBuff token(s)** as the node API keys in 9router or OmniRouter.
+3. **Routing Behavior:** When 9router or OmniRouter routes a request, it sends the key as `Authorization: Bearer <freebuff-token>`. The proxy lazily creates and caches upstream free sessions for each token without saving any token to disk.
 ```
 
 ---
