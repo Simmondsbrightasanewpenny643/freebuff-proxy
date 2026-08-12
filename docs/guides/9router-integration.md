@@ -95,6 +95,37 @@ npm run build
 PORT=20128 HOSTNAME=0.0.0.0 npm run start
 ```
 
+**Option C — Docker (published image):**
+
+Multi-platform images (`linux/amd64`, `linux/arm64`) are published to Docker Hub
+(`decolua/9router`) and GHCR (`ghcr.io/decolua/9router`):
+
+```bash
+docker run -d \
+  --name 9router \
+  -p 20128:20128 \
+  -v "$HOME/.9router:/app/data" \
+  -e DATA_DIR=/app/data \
+  decolua/9router:latest
+```
+
+→ Open http://localhost:20128. Container defaults: `PORT=20128`, `HOSTNAME=0.0.0.0`.
+
+- **Data persistence:** `$HOME/.9router/db/data.sqlite` on the host maps to
+  `/app/data/db/data.sqlite` in the container. Set `JWT_SECRET` and `INITIAL_PASSWORD`
+  via `-e` to keep sessions stable across restarts.
+- **Useful commands:** `docker logs -f 9router`, `docker restart 9router`,
+  `docker stop 9router && docker rm 9router`, `docker pull decolua/9router:latest` to update.
+- **9router in Docker + freebuff-proxy on the host:** use the compose bridge gateway as
+  the proxy's Base URL (section 1) — the container reaches the host via the gateway IP
+  (commonly `172.17.0.1`/`172.18.0.1`).
+- **Freebuff-proxy also in Docker:** both on the same bridge network; the proxy's compose
+  publishes port 3457, so use the proxy container's network-gateway Base URL
+  (print it with `scripts/setup-proxy-docker.sh`).
+- The reference repo ships a `docker-compose.yml` that also starts a **headroom** companion
+  container (`ghcr.io/chopratejas/headroom`, port 8787, `HEADROOM_URL=http://headroom:8787`)
+  for the RTK headroom saver — optional; freebuff-proxy does not need it.
+
 Data lives in `DATA_DIR` (SQLite). Default port: **20128** (dashboard `/dashboard`, API `/v1`).
 On first run (v0.5.50+) 9router auto-provisions a **Default Key** for the dashboard.
 
@@ -254,7 +285,7 @@ providers, before nothing, or as a dedicated free tier).
 | `429` rate limit | Exponential backoff: 2s x 2^n, max 5 min |
 | Text rules: rate limit / quota / capacity / overloaded | Same backoff, applied at level <= 15 |
 | "No credentials" | Connection skipped for 2 minutes |
-| `502` / `503` / `504` | Wait up to 5s between tries |
+| Any other error (incl. `502` / `503` / `504`) | No status rule matched; next connection tried with a 30s transient cooldown (the 5s cooldown in the source applies only to "request not allowed" text errors) |
 | All models failed | Client gets `503` with the earliest `retryAfter` |
 | Per-model locks | A failing model is locked per `modelLock_<model>` so other models keep working |
 
