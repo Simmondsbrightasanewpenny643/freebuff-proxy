@@ -405,6 +405,7 @@ message.
 | `503 waiting_room_queued` + Retry-After | FreeBuff waiting room (quota/hourly). Normal; 9router/opencode retry automatically |
 | `429` with `rate_limited` | GLM 5/20h cap, or token daily quota (6 sessions on the limited tier). Switch model or wait; 9router backs off with the proxy's `resetAt` |
 | `502 upstream_unavailable` | Token in 30-min cooldown after a 401, or all tokens failed. Check `healthz` |
+| `403` `account_banned` / `{"status":"banned"}` | The FreeBuff account was banned upstream (ToS risk, documented in the README). Rotate to a new token/account; the proxy skips the token during the ban window (upstream `resumes-at`, or 24h) and re-probes automatically after it |
 | Model streams `reasoning_content` | By design (CLI-faithful). 9router handles it; don't strip it |
 | 9router shows provider disconnected | Proxy restarted mid-flight; sessions recover transparently on the next request |
 | Every request returns `404` | Provider API type is set to **Responses**; the proxy only implements Chat Completions (section 3) |
