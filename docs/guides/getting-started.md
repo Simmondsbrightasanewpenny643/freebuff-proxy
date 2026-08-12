@@ -43,8 +43,7 @@ irm https://raw.githubusercontent.com/trefeon/freebuff-proxy/main/scripts/instal
 Follow the prompts to pick your token or enable bridge mode.
 
 #### How to obtain your FreeBuff token (`authToken`):
-- **CLI (Recommended):** Run `npm i -g freebuff` and `freebuff` to log in. The CLI saves your `authToken` in `~/.config/manicode/credentials.json`.
-- **Web:** Log in at `https://freebuff.llm.pm` -> **Freebuff Auth** -> **Generate login URL** (`https://freebuff.com/login?auth_code=...`). Open the link to authenticate.
+Run `npm i -g freebuff` and `freebuff` to log in via browser. The CLI saves your `authToken` in `~/.config/manicode/credentials.json` (Windows: `C:\Users\<you>\.config\manicode\credentials.json`).
 ---
 
 ### Option B: Docker Compose
@@ -94,6 +93,6 @@ Run `./freebuff-proxy -doctor` to diagnose problems automatically.
 | Error / Symptom | Cause & Fix |
 |---|---|
 | `502` + `403 free_mode_cli_required` | Upstream CLI-only enforcement on free tier. Setup is fine; see FAQ. |
-| `502` + `401 Invalid API key` | Token in `.env` is expired or invalid. Get a fresh token at https://freebuff.llm.pm. |
+| `502` + `401 Invalid API key` | Token in `.env` is expired or invalid. Re-run `freebuff` to log in and update `AUTH_TOKENS`. |
 | Connection refused | Proxy is not running, or in Docker without `LISTEN_ADDR=:3457`. |
 | `403 account_banned` | Account suspended upstream. Token is dead; use a new established account. |

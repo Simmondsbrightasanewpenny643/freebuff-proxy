@@ -22,8 +22,7 @@ source code (dashboard modals, API routes, `open-sse/` fallback engine, `.env.ex
 
 ## 1. Prerequisites: the proxy must be running and reachable
 
-1. Get a token (see README, *Getting a token*: `freebuff.llm.pm` or
-   `~/.config/manicode/credentials.json`).
+1. Get a token (see README, *Getting a token*: official CLI `freebuff` saves `authToken` to `~/.config/manicode/credentials.json`).
 2. Run freebuff-proxy **with the token** (any of these):
    - **Same machine as 9router (recommended):** build + run, or the systemd unit below
    - **Docker:** `docker compose up --build -d` (the compose file sets `LISTEN_ADDR=:3457`
