@@ -151,6 +151,9 @@ Query `http://localhost:3457/v1/models` for the full live list.
 
 | Model ID | Provider | Best for |
 |---|---|---|
-| `deepseek/deepseek-v4-flash` | DeepSeek | Fast coding, auto-complete, inline refactors |
-| `z-ai/glm-5.2` | Zhipu AI | Code explanation, architecture, complex reasoning |
-| `meta-llama/llama-3.3-70b-instruct` | Meta | General instructions & conversation |
+| `deepseek/deepseek-v4-flash` | DeepSeek | Fast coding, reasoning, smart agent turns (Unlimited) |
+| `thudm/glm-5.2` | Zhipu AI | Code explanation, architecture, complex reasoning |
+| `moonshot/kimi-k2.5` | Moonshot | Long context window, deep coding tasks |
+| `minimax/minimax-m3` | MiniMax | Fast coding turns, multimodal image support |
+| `xiaomi/mimo-v2.5` | Xiaomi | Balanced coding agent turns, multimodal support |
+| `deepseek/deepseek-v4-pro` | DeepSeek | Deep reasoning, complex problem solving (Premium) |
