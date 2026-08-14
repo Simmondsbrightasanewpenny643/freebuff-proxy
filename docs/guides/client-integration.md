@@ -141,7 +141,6 @@ For multi-account management or multi-user API routing:
    + **Base URL:** `http://localhost:3457/v1` (or container host `http://host.docker.internal:3457/v1`)
    + **API Keys:** Add your actual **FreeBuff token(s)** as the node API keys in 9router or OmniRouter.
 3. **Routing Behavior:** When 9router or OmniRouter routes a request, it sends the key as `Authorization: Bearer <freebuff-token>`. The proxy lazily creates and caches upstream free sessions for each token without saving any token to disk.
-```
 
 ---
 

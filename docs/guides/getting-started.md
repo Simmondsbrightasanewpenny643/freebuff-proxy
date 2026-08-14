@@ -64,16 +64,17 @@ Run the diagnostic tool or curl:
 # Diagnostic doctor check:
 ./freebuff-proxy -doctor
 
-# Quick health check:
+# Quick health check (JSON snapshot with session ID, risk level, models):
 curl http://localhost:3457/healthz
+
+# Prometheus metrics scrape endpoint:
+curl http://localhost:3457/metrics
 
 # List available models:
 curl http://localhost:3457/v1/models
 ```
 
 `/healthz` returning status `200` means your proxy setup is **100% correct**.
-
----
 
 ## Step 3: Connect Your Favorite AI Client
 
